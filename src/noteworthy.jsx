@@ -44,6 +44,8 @@ async function musicSearch(q) {
       artist: t.artistName,
       cover: t.artworkUrl100?.replace("100x100bb", "600x600bb") ?? null,
       year: t.releaseDate?.slice(0, 4) ?? null,
+      previewUrl: t.previewUrl ?? null,
+      appleUrl: t.trackViewUrl ?? null,
     }));
   const albums = (albumsRes.results || [])
     .filter(a => a.wrapperType === "collection" && a.collectionType === "Album")
@@ -54,8 +56,52 @@ async function musicSearch(q) {
       artist: a.artistName,
       cover: a.artworkUrl100?.replace("100x100bb", "600x600bb") ?? null,
       year: a.releaseDate?.slice(0, 4) ?? null,
+      appleUrl: a.collectionViewUrl ?? null,
     }));
   return { tracks, albums };
+}
+
+/* ── Audio preview manager ── */
+let _previewEl = null;
+let _stopPreview = null;
+
+function PreviewButton({ url, large = false }) {
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => () => { if (playing) { _previewEl?.pause(); _previewEl = null; _stopPreview = null; } }, [playing]);
+  if (!url) return null;
+  function toggle(e) {
+    e.stopPropagation();
+    if (playing) {
+      _previewEl?.pause(); _previewEl = null; _stopPreview = null; setPlaying(false);
+    } else {
+      if (_stopPreview) _stopPreview();
+      const el = new Audio(url);
+      _previewEl = el;
+      const stop = () => { setPlaying(false); _previewEl = null; _stopPreview = null; };
+      _stopPreview = () => { el.pause(); stop(); };
+      el.addEventListener("ended", stop);
+      el.play().catch(stop);
+      setPlaying(true);
+    }
+  }
+  const sz = large ? 18 : 11;
+  return (
+    <div role="button" className={`preview-btn${large ? " preview-btn-lg" : ""}`} onClick={toggle} title={playing ? "Pause preview" : "Play 30s preview"}>
+      {playing
+        ? <svg viewBox="0 0 24 24" width={sz} height={sz} fill="white"><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></svg>
+        : <svg viewBox="0 0 24 24" width={sz} height={sz} fill="white"><polygon points="6,3 20,12 6,21" /></svg>
+      }
+    </div>
+  );
+}
+
+function CoverWithPreview({ item, size }) {
+  return (
+    <div style={{ position: "relative", flexShrink: 0, display: "inline-flex" }}>
+      <CoverArt item={item} size={size} />
+      {item?.previewUrl && <PreviewButton url={item.previewUrl} />}
+    </div>
+  );
 }
 
 /* ── localStorage (profile cache + UI prefs — tokens managed by Supabase SDK) ── */
@@ -159,6 +205,8 @@ function normalizeReview(row) {
       artist: row.item_artist,
       cover: row.item_cover ?? null,
       year: row.item_year ?? null,
+      previewUrl: row.item_preview_url ?? null,
+      appleUrl: row.item_apple_url ?? null,
     },
     likes: (row.likes ?? []).map(l => l.user_id),
     comments: (row.comments ?? []).map(c => ({
@@ -390,7 +438,7 @@ function InlineSearch({ onSelect, placeholder = "Search songs or albums…" }) {
           <div className="isb-list">
             {list.map(item => (
               <button key={item.id} className="isb-row" onClick={() => pick(item)}>
-                <CoverArt item={item} size={36} />
+                <CoverWithPreview item={item} size={36} />
                 <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
                   <div className="isb-name">{item.title}</div>
                   <div className="isb-meta">{item.artist}{item.year ? ` · ${item.year}` : ""}</div>
@@ -454,7 +502,7 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
                 <input
                   className="isb-input"
                   style={{ fontSize: 16 }}
-                  placeholder="Search Spotify…"
+                  placeholder="Search music…"
                   value={searchQ}
                   onChange={e => setSearchQ(e.target.value)}
                   autoFocus
@@ -476,7 +524,7 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
             {/* Results */}
             {searchList.map(r => (
               <button key={r.id} className="isb-row" style={{ borderRadius: 8, marginBottom: 6, border: "1px solid var(--border)", padding: "12px 14px" }} onClick={() => { setItem(r); setSearchQ(""); setSearchRes(null); }}>
-                <CoverArt item={r} size={48} />
+                <CoverWithPreview item={r} size={48} />
                 <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
                   <div className="isb-name" style={{ fontSize: 15, maxWidth: "100%" }}>{r.title}</div>
                   <div className="isb-meta" style={{ fontSize: 13, marginTop: 2 }}>{r.artist}{r.year ? ` · ${r.year}` : ""}</div>
@@ -658,7 +706,7 @@ function ListScreen({ initList = null, isEdit = false, onSubmit, onClose }) {
           <input
             className="isb-input"
             style={{ fontSize: 15 }}
-            placeholder="Search Spotify…"
+            placeholder="Search music…"
             value={searchQ}
             onChange={e => setSearchQ(e.target.value)}
           />
@@ -676,7 +724,7 @@ function ListScreen({ initList = null, isEdit = false, onSubmit, onClose }) {
 
         {searchList.map(r => (
           <button key={r.id} className="isb-row" style={{ borderRadius: 8, marginBottom: 6, border: "1px solid var(--border)", padding: "12px 14px", opacity: items.find(i => i.id === r.id) ? 0.4 : 1 }} onClick={() => addItem(r)}>
-            <CoverArt item={r} size={42} />
+            <CoverWithPreview item={r} size={42} />
             <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
               <div className="isb-name" style={{ fontSize: 14, maxWidth: "100%" }}>{r.title}</div>
               <div className="isb-meta" style={{ fontSize: 12, marginTop: 2 }}>{r.artist}{r.year ? ` · ${r.year}` : ""}</div>
@@ -1853,7 +1901,10 @@ function ReviewDetailPage({ review, reviews, allUsers, currentUser, myId, toggle
       <div className="scroll-area">
         <div className="rd-art-hero">
           {live.item.cover && <div className="rd-art-bg" style={{ backgroundImage: `url(${live.item.cover})` }} />}
-          <CoverArt item={live.item} size={116} />
+          <div style={{ position: "relative", display: "inline-flex" }}>
+            <CoverArt item={live.item} size={116} />
+            {live.item.previewUrl && <PreviewButton url={live.item.previewUrl} large />}
+          </div>
         </div>
         <div className="rd-info">
           <div className="rd-title">{live.item.title}</div>
@@ -1868,6 +1919,12 @@ function ReviewDetailPage({ review, reviews, allUsers, currentUser, myId, toggle
             <svg viewBox="0 0 24 24" width="16" height="16" fill={liked ? "#E9463F" : "none"} stroke={liked ? "#E9463F" : "#555"} strokeWidth="2" strokeLinecap="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" /></svg>
             {live.likes?.length || 0} {live.likes?.length === 1 ? "like" : "likes"}
           </button>
+          {live.item.appleUrl && (
+            <a className="apple-music-link" href={live.item.appleUrl} target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M23.994 6.124a9.23 9.23 0 00-.24-2.19c-.317-1.31-1.062-2.31-2.18-3.043a5.022 5.022 0 00-1.877-.726 10.496 10.496 0 00-1.564-.15c-.04-.003-.083-.01-.124-.013H5.986c-.152.01-.303.017-.455.026C4.786.07 4.043.15 3.34.428 2.004.958 1.04 1.88.475 3.208c-.192.448-.292.925-.363 1.408-.056.392-.088.785-.1 1.18 0 .032-.007.062-.01.093v12.223c.01.14.017.283.027.424.05.815.154 1.624.497 2.373.65 1.42 1.738 2.353 3.234 2.802.42.127.856.187 1.293.228.555.053 1.11.06 1.667.06h11.03c.525 0 1.048-.034 1.57-.1.823-.106 1.597-.35 2.296-.81a5.046 5.046 0 001.88-2.207c.186-.42.293-.87.37-1.324.113-.675.14-1.358.138-2.04-.003-3.8 0-7.595-.003-11.393zm-6.423 3.99v5.712c0 .417-.058.827-.244 1.206-.29.59-.76.962-1.388 1.14-.35.1-.706.157-1.07.173-.95.045-1.773-.6-1.943-1.536a1.88 1.88 0 011.038-2.022c.323-.16.67-.25 1.018-.324.378-.082.758-.153 1.134-.24.274-.063.457-.23.51-.516a.904.904 0 00.02-.183c0-1.956 0-3.912.003-5.868 0-.122-.034-.16-.156-.138-.795.154-1.59.3-2.387.45l-3.235.616c-.1.02-.161.055-.161.18.004 2.8.003 5.6.003 8.4v.188c0 .002-.004.006-.01.016-.12-.048-.232-.09-.34-.142a1.869 1.869 0 01-1.08-1.726c.015-.9.584-1.67 1.44-1.938.318-.1.65-.157.974-.228.356-.076.713-.15 1.07-.225.25-.053.45-.2.51-.47a.921.921 0 00.022-.21c.001-1.994 0-3.988.003-5.982 0-.135.033-.167.166-.19l5.822-1.1c.151-.026.22.004.22.188-.006 1.093-.003 2.185-.003 3.278z"/></svg>
+              Open in Apple Music
+            </a>
+          )}
         </div>
         <div className="comments">
           <div className="sect-label" style={{ marginBottom: 12 }}>Comments · {live.comments?.length || 0}</div>
@@ -2188,4 +2245,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .name-edit-cancel:hover{color:var(--text2)}
 .name-pencil-btn{background:none;border:none;color:var(--text4);cursor:pointer;padding:4px;display:flex;align-items:center;transition:color .12s;flex-shrink:0}
 .name-pencil-btn:hover{color:var(--green)}
+.preview-btn{position:absolute;bottom:4px;right:4px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.7);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;backdrop-filter:blur(4px);transition:background .15s;z-index:2}
+.preview-btn:hover{background:rgba(0,0,0,.9)}
+.preview-btn-lg{width:34px;height:34px;bottom:7px;right:7px}
+.apple-music-link{display:inline-flex;align-items:center;gap:6px;color:var(--text3);font-size:13px;font-family:var(--font);text-decoration:none;padding:6px 10px;border:1px solid var(--border);border-radius:6px;transition:color .15s,border-color .15s}
+.apple-music-link:hover{color:#fc3c44;border-color:#fc3c44}
 `;

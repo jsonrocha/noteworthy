@@ -97,6 +97,8 @@ export async function insertReview(review) {
         item_artist: review.item.artist,
         item_cover: review.item.cover ?? null,
         item_year: review.item.year ?? null,
+        item_preview_url: review.item.previewUrl ?? null,
+        item_apple_url: review.item.appleUrl ?? null,
         stars: review.stars,
         body: review.text ?? null,
     }).select().single();
