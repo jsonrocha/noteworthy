@@ -27,43 +27,35 @@ import {
   updateDisplayName,
 } from "./db.js";
 
-/* ── Spotify Client Credentials token (search only — no user login required) ── */
-const SP_CLIENT_ID     = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
-const SP_CLIENT_SECRET = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET;
-let _spToken = null, _spTokenExp = 0;
-
-async function getSpotifyToken() {
-  if (_spToken && Date.now() < _spTokenExp - 60000) return _spToken;
-  if (!SP_CLIENT_ID || !SP_CLIENT_SECRET) return null;
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: "Basic " + btoa(`${SP_CLIENT_ID}:${SP_CLIENT_SECRET}`),
-    },
-    body: "grant_type=client_credentials",
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  _spToken = data.access_token;
-  _spTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
-  return _spToken;
-}
-
-async function spSearch(q, types) {
+/* ── iTunes Search (no auth, no API key required) ── */
+async function musicSearch(q) {
   if (!q?.trim()) return null;
-  const token = await getSpotifyToken();
-  if (!token) return null;
-  const qs = `q=${encodeURIComponent(q.trim())}&type=${types}&limit=10`;
-  const res = await fetch(`https://api.spotify.com/v1/search?${qs}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    console.error("[spSearch] API error", res.status, err);
-    return null;
-  }
-  return res.json();
+  const base = `https://itunes.apple.com/search?${new URLSearchParams({ term: q.trim(), media: "music", limit: "10" })}`;
+  const [tracksRes, albumsRes] = await Promise.all([
+    fetch(base + "&entity=song").then(r => r.json()).catch(() => ({ results: [] })),
+    fetch(base + "&entity=album").then(r => r.json()).catch(() => ({ results: [] })),
+  ]);
+  const tracks = (tracksRes.results || [])
+    .filter(t => t.wrapperType === "track")
+    .map(t => ({
+      id: String(t.trackId),
+      type: "track",
+      title: t.trackName,
+      artist: t.artistName,
+      cover: t.artworkUrl100?.replace("100x100bb", "600x600bb") ?? null,
+      year: t.releaseDate?.slice(0, 4) ?? null,
+    }));
+  const albums = (albumsRes.results || [])
+    .filter(a => a.wrapperType === "collection" && a.collectionType === "Album")
+    .map(a => ({
+      id: String(a.collectionId),
+      type: "album",
+      title: a.collectionName,
+      artist: a.artistName,
+      cover: a.artworkUrl100?.replace("100x100bb", "600x600bb") ?? null,
+      year: a.releaseDate?.slice(0, 4) ?? null,
+    }));
+  return { tracks, albums };
 }
 
 /* ── localStorage (profile cache + UI prefs — tokens managed by Supabase SDK) ── */
@@ -369,9 +361,7 @@ function InlineSearch({ onSelect, placeholder = "Search songs or albums…" }) {
     deb.current = setTimeout(async () => {
       setLoading(true);
       try {
-        const d = await spSearch(q, "track,album");
-        const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
-        const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
+        const { tracks, albums } = await musicSearch(q) ?? { tracks: [], albums: [] };
         setRes({ tracks, albums }); setOpen(true);
       } catch (e) { console.error("Search error:", e); }
       setLoading(false);
@@ -433,9 +423,7 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const d = await spSearch(searchQ, "track,album");
-        const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
-        const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
+        const { tracks, albums } = await musicSearch(searchQ) ?? { tracks: [], albums: [] };
         setSearchRes({ tracks, albums });
       } catch (e) { console.error(e); }
       setSearching(false);
@@ -582,9 +570,7 @@ function ListScreen({ initList = null, isEdit = false, onSubmit, onClose }) {
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const d = await spSearch(searchQ, "track,album");
-        const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
-        const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
+        const { tracks, albums } = await musicSearch(searchQ) ?? { tracks: [], albums: [] };
         setSearchRes({ tracks, albums });
       } catch (e) { console.error(e); }
       setSearching(false);
@@ -1374,9 +1360,7 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const d = await spSearch(searchQ, "track,album");
-        const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
-        const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
+        const { tracks, albums } = await musicSearch(searchQ) ?? { tracks: [], albums: [] };
         setSearchResults({ tracks, albums });
       } catch (e) { console.error(e); }
       setSearching(false);
