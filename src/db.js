@@ -4,7 +4,9 @@ import { supabase } from './supabase.js';
 export async function upsertUser(profile) {
     const { error } = await supabase.from('users').upsert({
         id: profile.id,
+        username: profile.username,
         display_name: profile.display_name,
+        email: profile.email ?? null,
         avatar_url: profile.images?.[0]?.url ?? null,
     }, { onConflict: 'id' });
     if (error) console.error('upsertUser', error);
@@ -237,4 +239,48 @@ export async function updateList(list) {
 export async function deleteList(id) {
     const { error } = await supabase.from('lists').delete().eq('id', id);
     if (error) console.error('deleteList', error);
+}
+
+/* ── Notifications ── */
+export async function getNotifications(userId) {
+    // Step 1: get the user's own review IDs + metadata
+    const { data: myReviews } = await supabase
+        .from('reviews').select('id, item_title, item_artist').eq('user_id', userId);
+    if (!myReviews?.length) return [];
+
+    const ids = myReviews.map(r => r.id);
+    const reviewMeta = Object.fromEntries(myReviews.map(r => [r.id, { title: r.item_title, artist: r.item_artist }]));
+
+    // Step 2: fetch comments + likes on those reviews (excluding own actions)
+    const [{ data: comments }, { data: likes }] = await Promise.all([
+        supabase.from('comments')
+            .select('id, user_id, body, created_at, review_id')
+            .in('review_id', ids).neq('user_id', userId)
+            .order('created_at', { ascending: false }).limit(50),
+        supabase.from('likes')
+            .select('user_id, review_id, created_at')
+            .in('review_id', ids).neq('user_id', userId)
+            .order('created_at', { ascending: false }).limit(50),
+    ]);
+
+    return [
+        ...(comments ?? []).map(c => ({
+            type: 'comment', id: c.id, userId: c.user_id,
+            reviewId: c.review_id, text: c.body, createdAt: c.created_at,
+            itemTitle: reviewMeta[c.review_id]?.title ?? '',
+            itemArtist: reviewMeta[c.review_id]?.artist ?? '',
+        })),
+        ...(likes ?? []).map(l => ({
+            type: 'like', id: `like-${l.user_id}-${l.review_id}`,
+            userId: l.user_id, reviewId: l.review_id, createdAt: l.created_at,
+            itemTitle: reviewMeta[l.review_id]?.title ?? '',
+            itemArtist: reviewMeta[l.review_id]?.artist ?? '',
+        })),
+    ].sort((a, b) => new Date(b.createdAt ?? 0) - new Date(a.createdAt ?? 0));
+}
+
+/* ── Profile updates ── */
+export async function updateDisplayName(userId, displayName) {
+    const { error } = await supabase.from('users').update({ display_name: displayName }).eq('id', userId);
+    if (error) console.error('updateDisplayName', error);
 }

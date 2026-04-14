@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
+import { supabase } from "./supabase.js";
 import {
-  upsertUser,
   getFeedReviews,
   getAllReviews,
   getUserReviews,
@@ -23,91 +23,40 @@ import {
   getAllUsers,
   searchUsers,
   subscribeToFeed,
+  getNotifications,
+  updateDisplayName,
 } from "./db.js";
 
-/* ═══════════════════════════════════════════════════════════════
-   SPOTIFY CONFIG
-═══════════════════════════════════════════════════════════════ */
-const SPOTIFY_CLIENT_ID = "ca576640f2414bc2bc00fb45f69add96";
-const REDIRECT_URI = import.meta.env.VITE_REDIRECT_URI || "http://127.0.0.1:5173/";
-const SCOPES = "user-read-private user-read-email user-read-recently-played user-top-read";
+/* ── Spotify Client Credentials token (search only — no user login required) ── */
+const SP_CLIENT_ID     = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
+const SP_CLIENT_SECRET = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET;
+let _spToken = null, _spTokenExp = 0;
 
-async function generateCodeChallenge() {
-  const verifier = Array.from(crypto.getRandomValues(new Uint8Array(64)))
-    .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"[b % 66])
-    .join("");
-  sessionStorage.setItem("spotify_verifier", verifier);
-  const hashed = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  return btoa(String.fromCharCode(...new Uint8Array(hashed)))
-    .replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-}
-
-async function getSpotifyAuthUrl() {
-  const challenge = await generateCodeChallenge();
-  return `https://accounts.spotify.com/authorize?${new URLSearchParams({
-    client_id: SPOTIFY_CLIENT_ID, response_type: "code",
-    redirect_uri: REDIRECT_URI, scope: SCOPES,
-    code_challenge_method: "S256", code_challenge: challenge,
-  })}`;
-}
-
-async function exchangeCodeForToken(code) {
+async function getSpotifyToken() {
+  if (_spToken && Date.now() < _spTokenExp - 60000) return _spToken;
+  if (!SP_CLIENT_ID || !SP_CLIENT_SECRET) return null;
   const res = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code", code,
-      redirect_uri: REDIRECT_URI, client_id: SPOTIFY_CLIENT_ID,
-      code_verifier: sessionStorage.getItem("spotify_verifier"),
-    }),
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: "Basic " + btoa(`${SP_CLIENT_ID}:${SP_CLIENT_SECRET}`),
+    },
+    body: "grant_type=client_credentials",
   });
-  return res.ok ? res.json() : null;
+  if (!res.ok) return null;
+  const data = await res.json();
+  _spToken = data.access_token;
+  _spTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
+  return _spToken;
 }
 
-async function doRefreshToken(refreshToken) {
-  const res = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token", refresh_token: refreshToken,
-      client_id: SPOTIFY_CLIENT_ID,
-    }),
-  });
-  return res.ok ? res.json() : null;
-}
-
-async function fetchSpotifyProfile(token) {
-  const res = await fetch("https://api.spotify.com/v1/me", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return res.ok ? res.json() : null;
-}
-
-async function fetchRecentlyPlayed(token, limit = 20) {
-  const res = await fetch(
-    `https://api.spotify.com/v1/me/player/recently-played?limit=${limit}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  return res.ok ? res.json() : null;
-}
-
-async function fetchTopTracks(token, limit = 20) {
-  const res = await fetch(`https://api.spotify.com/v1/me/top/tracks?limit=${limit}&time_range=short_term`, { headers: { Authorization: `Bearer ${token}` } });
-  return res.ok ? res.json() : null;
-}
-
-async function fetchTopArtists(token, limit = 10) {
-  const res = await fetch(`https://api.spotify.com/v1/me/top/artists?limit=${limit}&time_range=short_term`, { headers: { Authorization: `Bearer ${token}` } });
-  return res.ok ? res.json() : null;
-}
-
-
-async function spSearch(q, types, token) {
-  if (!token || typeof token !== "string" || !q?.trim()) return null;
-  const cleanToken = token.trim();
+async function spSearch(q, types) {
+  if (!q?.trim()) return null;
+  const token = await getSpotifyToken();
+  if (!token) return null;
   const qs = `q=${encodeURIComponent(q.trim())}&type=${types}&limit=10`;
   const res = await fetch(`https://api.spotify.com/v1/search?${qs}`, {
-    headers: { Authorization: `Bearer ${cleanToken}` },
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -117,18 +66,32 @@ async function spSearch(q, types, token) {
   return res.json();
 }
 
-function extractCode() {
-  return new URLSearchParams(window.location.search).get("code");
-}
-
-/* ── localStorage (auth only — data lives in Supabase now) ── */
+/* ── localStorage (profile cache + UI prefs — tokens managed by Supabase SDK) ── */
 const LS = {
-  TOKEN: "nw_access_token",
-  REFRESH: "nw_refresh_token",
-  EXP: "nw_token_expires",
   PROFILE: "nw_profile",
   FAV_ARTISTS: "nw_fav_artists",
+  VERSION: "nw_ls_version",
+  NOTIF_SEEN: "nw_notif_seen",
 };
+
+// Bump this whenever the localStorage schema changes (e.g. auth migration).
+// Any browser with a different (or missing) version gets wiped clean on boot.
+const LS_VERSION = 2;
+
+function lsMigrate() {
+  try {
+    const stored = parseInt(localStorage.getItem(LS.VERSION) ?? "0", 10);
+    if (stored < LS_VERSION) {
+      // Wipe all nw_* keys so stale Spotify-era data can't interfere
+      Object.keys(localStorage)
+        .filter(k => k.startsWith("nw_"))
+        .forEach(k => localStorage.removeItem(k));
+      localStorage.setItem(LS.VERSION, String(LS_VERSION));
+    }
+  } catch { /* ignore — storage may be unavailable */ }
+}
+
+lsMigrate(); // runs once at module load, before any state is initialized
 
 function lsGet(key, fallback = null) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
@@ -139,41 +102,54 @@ function lsSet(key, val) {
 }
 function lsClear(...keys) { keys.forEach(k => localStorage.removeItem(k)); }
 
-/* ── Token store ── */
-const tokenStore = {
-  accessToken: lsGet(LS.TOKEN),
-  refreshToken: lsGet(LS.REFRESH),
-  expiresAt: lsGet(LS.EXP, 0),
-  isValid() { return !!(this.accessToken && Date.now() < this.expiresAt - 60000); },
-  save(data) {
-    const exp = Date.now() + (data.expires_in || 3600) * 1000;
-    this.accessToken = data.access_token;
-    this.expiresAt = exp;
-    if (data.refresh_token) this.refreshToken = data.refresh_token;
-    lsSet(LS.TOKEN, data.access_token);
-    lsSet(LS.EXP, exp);
-    if (data.refresh_token) lsSet(LS.REFRESH, data.refresh_token);
-  },
-  clear() {
-    this.accessToken = null; this.refreshToken = null; this.expiresAt = 0;
-    lsClear(LS.TOKEN, LS.REFRESH, LS.EXP, LS.PROFILE);
-  },
-};
+/* ═══════════════════════════════════════════════════════════════
+   SUPABASE AUTH
+═══════════════════════════════════════════════════════════════ */
+async function fetchUserProfile(userId) {
+  const { data } = await supabase.from("users").select("*").eq("id", userId).single();
+  return data ? normalizeUser(data) : null;
+}
 
-let refreshPromise = null;
-async function ensureToken() {
-  if (tokenStore.isValid()) return tokenStore.accessToken;
-  if (tokenStore.accessToken && tokenStore.expiresAt === 0) return tokenStore.accessToken;
-  if (!tokenStore.refreshToken) return null;
-  if (!refreshPromise) {
-    refreshPromise = doRefreshToken(tokenStore.refreshToken)
-      .then(data => {
-        if (data?.access_token) { tokenStore.save(data); return data.access_token; }
-        tokenStore.clear(); return null;
-      })
-      .finally(() => { refreshPromise = null; });
+// Creates the public profile row on first sign-in (user_metadata holds username from signUp)
+async function ensureProfileRow(session) {
+  const { data: existing } = await supabase
+    .from("users").select("id").eq("id", session.user.id).maybeSingle();
+  if (existing) return;
+  const { username, display_name } = session.user.user_metadata ?? {};
+  const { error } = await supabase.from("users").insert({
+    id: session.user.id,
+    username: username ?? session.user.email,
+    display_name: display_name ?? username ?? session.user.email,
+    email: session.user.email,
+    avatar_url: null,
+  });
+  if (error) console.error("ensureProfileRow error:", error.message);
+}
+
+async function authSignUp(username, email, password) {
+  const { data: existing } = await supabase
+    .from("users").select("id").eq("username", username).maybeSingle();
+  if (existing) throw new Error("Username already taken");
+
+  const { data, error } = await supabase.auth.signUp({
+    email, password,
+    options: { data: { username, display_name: username } },
+  });
+  if (error) throw error;
+  return data.user;
+}
+
+async function authSignIn(usernameOrEmail, password) {
+  let email = usernameOrEmail.trim();
+  if (!email.includes("@")) {
+    const { data: row } = await supabase
+      .from("users").select("email").eq("username", email).maybeSingle();
+    if (!row) throw new Error("No account found for that username");
+    email = row.email;
   }
-  return refreshPromise;
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  return data;
 }
 
 /* ── Data normalization — convert Supabase rows to app shape ── */
@@ -226,7 +202,9 @@ function normalizeList(row) {
 function normalizeUser(row) {
   return {
     id: row.id,
-    display_name: row.display_name,
+    username: row.username ?? "",
+    display_name: row.display_name ?? row.username ?? "",
+    email: row.email ?? "",
     images: row.avatar_url ? [{ url: row.avatar_url }] : [],
     bio: row.bio ?? "",
   };
@@ -370,7 +348,7 @@ function RichEditor({ value, onChange, placeholder = "Write your review…" }) {
   );
 }
 
-function InlineSearch({ onSelect, placeholder = "Search songs or albums…", disabled = false }) {
+function InlineSearch({ onSelect, placeholder = "Search songs or albums…" }) {
   const [q, setQ] = useState("");
   const [res, setRes] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -387,14 +365,11 @@ function InlineSearch({ onSelect, placeholder = "Search songs or albums…", dis
 
   useEffect(() => {
     if (!q.trim()) { setRes(null); setOpen(false); return; }
-    if (disabled) return;
     clearTimeout(deb.current);
     deb.current = setTimeout(async () => {
       setLoading(true);
       try {
-        const token = await ensureToken();
-        if (!token) { setLoading(false); return; }
-        const d = await spSearch(q, "track,album", token);
+        const d = await spSearch(q, "track,album");
         const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
         const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
         setRes({ tracks, albums }); setOpen(true);
@@ -410,8 +385,8 @@ function InlineSearch({ onSelect, placeholder = "Search songs or albums…", dis
     <div ref={wrap} className="isb-wrap">
       <div className="isb-field">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="M16.5 16.5L21 21" /></svg>
-        <input className="isb-input" placeholder={disabled ? "Connect Spotify to search…" : placeholder}
-          value={q} onChange={e => setQ(e.target.value)} onFocus={() => res && setOpen(true)} disabled={disabled} />
+        <input className="isb-input" placeholder={placeholder}
+          value={q} onChange={e => setQ(e.target.value)} onFocus={() => res && setOpen(true)} />
         {loading && <div className="isb-spin" />}
         {q && !loading && <button className="isb-x" onClick={() => { setQ(""); setOpen(false); }}>✕</button>}
       </div>
@@ -458,9 +433,7 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const token = await ensureToken();
-        if (!token) { setSearching(false); return; }
-        const d = await spSearch(searchQ, "track,album", token);
+        const d = await spSearch(searchQ, "track,album");
         const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
         const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
         setSearchRes({ tracks, albums });
@@ -609,9 +582,7 @@ function ListScreen({ initList = null, isEdit = false, onSubmit, onClose }) {
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const token = await ensureToken();
-        if (!token) { setSearching(false); return; }
-        const d = await spSearch(searchQ, "track,album", token);
+        const d = await spSearch(searchQ, "track,album");
         const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
         const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
         setSearchRes({ tracks, albums });
@@ -778,14 +749,14 @@ function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdi
   }, []);
   return (
     <article className="rc">
-      <div className="rc-art" onClick={() => navigate("reviewDetail", { reviewId: review.id })}>
+      <div className="rc-art" onClick={() => navigate("reviewDetail", { reviewId: review.id, reviewSnapshot: review })}>
         {review.item.cover ? <img src={review.item.cover} alt="" className="rc-art-img" /> : <div className="rc-art-bg" style={{ "--h": ((review.item.title || "").charCodeAt(0) * 23) % 360 }} />}
         <div className="rc-art-fade" />
         <div className="rc-art-stars"><Stars value={review.stars} size={13} /></div>
         <span className="rc-art-badge">{review.item.type}</span>
       </div>
       <div className="rc-body">
-        <div className="rc-track-row" onClick={() => navigate("reviewDetail", { reviewId: review.id })}>
+        <div className="rc-track-row" onClick={() => navigate("reviewDetail", { reviewId: review.id, reviewSnapshot: review })}>
           <div className="rc-track-name">{review.item.title}</div>
           <div className="rc-track-sub">{review.item.artist}{review.item.year ? ` · ${review.item.year}` : ""}</div>
         </div>
@@ -809,13 +780,13 @@ function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdi
             </div>
           )}
         </div>
-        {review.text && <div className="rc-snippet" onClick={() => navigate("reviewDetail", { reviewId: review.id })} dangerouslySetInnerHTML={{ __html: review.text }} />}
+        {review.text && <div className="rc-snippet" onClick={() => navigate("reviewDetail", { reviewId: review.id, reviewSnapshot: review })} dangerouslySetInnerHTML={{ __html: review.text }} />}
         <div className="rc-actions">
-          <button className={`rc-act ${liked ? "liked" : ""}`} onClick={() => toggleLike(review.id)}>
+          <button className={`rc-act ${liked ? "liked" : ""}`} onClick={() => toggleLike(review.id, review)}>
             <svg viewBox="0 0 24 24" width="13" height="13" fill={liked ? "#E9463F" : "none"} stroke={liked ? "#E9463F" : "#555"} strokeWidth="2" strokeLinecap="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" /></svg>
             {review.likes?.length > 0 && <span>{review.likes.length}</span>}
           </button>
-          <button className="rc-act" onClick={() => navigate("reviewDetail", { reviewId: review.id })}>
+          <button className="rc-act" onClick={() => navigate("reviewDetail", { reviewId: review.id, reviewSnapshot: review })}>
             <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#555" strokeWidth="2" strokeLinecap="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" /></svg>
             {review.comments?.length > 0 && <span>{review.comments.length}</span>}
           </button>
@@ -825,71 +796,108 @@ function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdi
   );
 }
 
-function RecentlyPlayed({ onReview, title = "Your Recent Listening" }) {
-  const [tracks, setTracks] = useState([]);
-  const [loading, setLoading] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    ensureToken().then(async token => {
-      if (!token || cancelled) { setLoading(false); return; }
-      try {
-        const data = await fetchRecentlyPlayed(token, 20);
-        if (cancelled) return;
-        if (data?.items) {
-          const seen = new Set();
-          const unique = data.items.filter(({ track }) => {
-            if (seen.has(track.id)) return false;
-            seen.add(track.id); return true;
-          });
-          setTracks(unique.slice(0, 12));
-        }
-      } catch { }
-      if (!cancelled) setLoading(false);
-    });
-    return () => { cancelled = true; };
-  }, []);
-
-  if (loading) return (
-    <div className="rp-wrap">
-      <div className="rp-header-row"><span className="rp-header">{title}</span></div>
-      <div style={{ display: "flex", gap: 10, padding: "8px 0 4px" }}>
-        {[1, 2, 3, 4, 5].map(i => <div key={i} className="rp-skeleton" />)}
-      </div>
-    </div>
-  );
-  if (!tracks.length) return null;
-
-  return (
-    <div className="rp-wrap">
-      <div className="rp-header-row">
-        <svg viewBox="0 0 24 24" width="13" height="13" fill="#1DB954" style={{ flexShrink: 0 }}><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424a.622.622 0 01-.857.207c-2.348-1.435-5.304-1.76-8.785-.964a.622.622 0 11-.277-1.215c3.809-.87 7.077-.496 9.712 1.115a.623.623 0 01.207.857zm1.223-2.722a.78.78 0 01-1.072.257c-2.687-1.652-6.785-2.131-9.965-1.166a.78.78 0 01-.973-.519.781.781 0 01.519-.972c3.632-1.102 8.147-.568 11.234 1.328a.78.78 0 01.257 1.072zm.105-2.835c-3.223-1.914-8.54-2.09-11.618-1.156a.935.935 0 11-.543-1.79c3.532-1.073 9.404-.865 13.115 1.338a.935.935 0 01-.954 1.608z" /></svg>
-        <span className="rp-header">{title}</span>
-        <span className="rp-hint">Tap to review</span>
-      </div>
-      <div className="rp-scroll">
-        {tracks.map(({ track, played_at }) => {
-          const item = { id: track.id, type: "track", title: track.name, artist: track.artists.map(a => a.name).join(", "), cover: track.album?.images?.[0]?.url, year: track.album?.release_date?.slice(0, 4) };
-          return (
-            <div key={track.id + played_at} className="rp-card" onClick={() => onReview(item)}>
-              <div className="rp-art-wrap">
-                {item.cover ? <img src={item.cover} alt="" className="rp-art" /> : <div className="rp-art-fallback" style={{ "--h": (item.title.charCodeAt(0) * 23) % 360 }} />}
-                <div className="rp-hover-layer">
-                  <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
-                </div>
-              </div>
-              <div className="rp-name">{item.title}</div>
-              <div className="rp-artist">{item.artist}</div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
 
 /* ═══════════════════════════════════════════════════════════════
    MAIN APP
 ═══════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════
+   AUTH PAGE  (sign-in / sign-up)
+═══════════════════════════════════════════════════════════════ */
+function AuthPage() {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [checkEmail, setCheckEmail] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    // Validate before hitting network
+    if (mode === "signup") {
+      if (!username.trim()) { setError("Username is required"); return; }
+      if (username.includes("@")) { setError("Username cannot contain @"); return; }
+    }
+    setLoading(true);
+    try {
+      if (mode === "signup") {
+        const user = await authSignUp(username.trim(), email.trim(), password);
+        // If Supabase email confirmation is ON, there's no session yet — show prompt
+        if (!user?.confirmed_at && !user?.email_confirmed_at) {
+          // onAuthStateChange will handle everything once they click the link
+          // For now just keep loading=false and let the user know
+          setCheckEmail(true);
+          return;
+        }
+        // Email confirmation OFF: onAuthStateChange SIGNED_IN handles the rest
+      } else {
+        await authSignIn(username.trim(), password);
+        // onAuthStateChange SIGNED_IN handles profile hydration + unmounting this page
+      }
+    } catch (err) {
+      setError(err.message ?? "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (checkEmail) return (
+    <>
+      <style>{CSS}</style>
+      <div className="landing">
+        <div className="landing-inner">
+          <div className="landing-logo"><span className="landing-note">♪</span><span className="landing-wordmark">noteworthy</span></div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 36, marginBottom: 12 }}>✉️</div>
+            <p style={{ fontSize: 16, color: "var(--text)", fontWeight: 600, marginBottom: 8 }}>Check your email</p>
+            <p style={{ fontSize: 14, color: "var(--text2)", lineHeight: 1.6 }}>We sent a confirmation link to <strong>{email}</strong>. Click it to finish creating your account.</p>
+          </div>
+          <button className="auth-toggle-btn" onClick={() => { setCheckEmail(false); setMode("signin"); }}>Back to sign in</button>
+        </div>
+      </div>
+    </>
+  );
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="landing">
+        <div className="landing-inner" style={{ gap: 16 }}>
+          <div className="landing-logo"><span className="landing-note">♪</span><span className="landing-wordmark">noteworthy</span></div>
+          <p className="landing-tagline">Track the music you've heard.<br />Tell your friends what's worth it.</p>
+
+          <form className="auth-form" onSubmit={handleSubmit}>
+            {mode === "signup" && (
+              <input className="auth-input" type="text" placeholder="Username" autoCapitalize="none"
+                value={username} onChange={e => setUsername(e.target.value)} required />
+            )}
+            <input className="auth-input" type={mode === "signin" ? "text" : "email"}
+              placeholder={mode === "signin" ? "Username or email" : "Email"}
+              autoCapitalize="none" value={mode === "signin" ? (username || email) : email}
+              onChange={e => mode === "signin" ? setUsername(e.target.value) : setEmail(e.target.value)}
+              required />
+            <input className="auth-input" type="password" placeholder="Password"
+              value={password} onChange={e => setPassword(e.target.value)} required />
+            {error && <p className="auth-error">{error}</p>}
+            <button className="auth-submit" type="submit" disabled={loading}>
+              {loading ? <span className="auth-spin" /> : mode === "signup" ? "Create account" : "Sign in"}
+            </button>
+          </form>
+
+          <p className="auth-toggle">
+            {mode === "signup" ? "Already have an account?" : "New to Noteworthy?"}
+            {" "}<button className="auth-toggle-btn" onClick={() => { setMode(mode === "signup" ? "signin" : "signup"); setError(""); }}>
+              {mode === "signup" ? "Sign in" : "Create account"}
+            </button>
+          </p>
+        </div>
+      </div>
+    </>
+  );
+}
+
 export default function Noteworthy() {
   const [profile, setProfile] = useState(() => lsGet(LS.PROFILE));
   const [reviews, setReviews] = useState([]);
@@ -901,51 +909,90 @@ export default function Noteworthy() {
   const [modal, setModal] = useState(null);
   const [alert, setAlert] = useState(null);
   const [toast, setToast] = useState(null);
-  const [ready, setReady] = useState(false);
   const [dbLoading, setDbLoading] = useState(false);
   const [favoriteArtists, setFavoriteArtists] = useState(() => lsGet(LS.FAV_ARTISTS, []));
   const [artistPage, setArtistPage] = useState(null); // { artist } object
+  const [notifications, setNotifications] = useState([]);
+  const [notifSeen, setNotifSeen] = useState(() => lsGet(LS.NOTIF_SEEN, 0));
+
+  const unreadCount = notifications.filter(n => n.createdAt && new Date(n.createdAt) > new Date(notifSeen)).length;
+
+  function markNotifSeen() {
+    const now = Date.now();
+    setNotifSeen(now);
+    lsSet(LS.NOTIF_SEEN, now);
+  }
+
+  function updateProfileField(updates) {
+    const updated = { ...profile, ...updates };
+    setProfile(updated);
+    lsSet(LS.PROFILE, updated);
+    setAllUsers(prev => ({ ...prev, [myId]: { ...(prev[myId] ?? {}), ...updates } }));
+  }
 
   const myId = profile?.id;
 
   /* ── Boot sequence ── */
   useEffect(() => {
-    const code = extractCode();
-    if (code) {
-      window.history.replaceState({}, "", "/");
-      exchangeCodeForToken(code).then(async data => {
-        if (!data?.access_token) { setReady(true); return; }
-        tokenStore.save(data);
-        const prof = await fetchSpotifyProfile(data.access_token);
-        if (prof) {
-          setProfile(prof);
-          lsSet(LS.PROFILE, prof);
-          // Create/update user row in Supabase
-          await upsertUser(prof);
+    // We never call getSession() — it waits for Supabase's internal initialize()
+    // promise, which makes a network call when there's a stored session with an
+    // expired token. That call can hang indefinitely, causing an infinite loading screen.
+    //
+    // Instead: render immediately from the localStorage cache (ready=true from init),
+    // and let onAuthStateChange fire INITIAL_SESSION once Supabase is done.
+    //
+    // Safety valve: if initialize() hasn't resolved in 5 seconds, directly delete
+    // the auth token key from localStorage (bypasses the SDK — no SDK call hangs here)
+    // and clear the profile so the user lands on the sign-in page.
+    let supabaseReady = false;
+
+    const safetyTimer = setTimeout(() => {
+      if (supabaseReady) return;
+      console.warn("Supabase init timed out — wiping stored auth token");
+      Object.keys(localStorage)
+        .filter(k => k.startsWith("sb-") && k.endsWith("-auth-token"))
+        .forEach(k => localStorage.removeItem(k));
+      lsClear(LS.PROFILE);
+      setProfile(null);
+    }, 5000);
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      supabaseReady = true;
+      clearTimeout(safetyTimer);
+
+      if (event === "INITIAL_SESSION") {
+        if (session) {
+          try {
+            await ensureProfileRow(session);
+            const prof = await fetchUserProfile(session.user.id);
+            if (prof) { setProfile(prof); lsSet(LS.PROFILE, prof); }
+            else { lsClear(LS.PROFILE); setProfile(null); }
+          } catch (e) { console.error("profile hydration error", e); }
+        } else {
+          lsClear(LS.PROFILE);
+          setProfile(null);
         }
-        setReady(true);
-      });
-      return;
-    }
-    if (tokenStore.isValid() || tokenStore.refreshToken) {
-      ensureToken().then(async token => {
-        // Re-upsert user on every boot so the DB row always exists
-        if (token) {
-          const storedProfile = lsGet(LS.PROFILE);
-          if (storedProfile) await upsertUser(storedProfile);
-        }
-        setReady(true);
-      });
-    } else {
-      setReady(true);
-    }
+      } else if (event === "SIGNED_IN" && session) {
+        try {
+          await ensureProfileRow(session);
+          const prof = await fetchUserProfile(session.user.id);
+          if (prof) { setProfile(prof); lsSet(LS.PROFILE, prof); }
+        } catch (e) { console.error("sign-in error", e); }
+      } else if (event === "SIGNED_OUT") {
+        lsClear(LS.PROFILE);
+        setProfile(null); setReviews([]); setLists([]); setFollowing([]);
+        setTab("feed"); setSubPage(null); setModal(null);
+      }
+    });
+
+    return () => { clearTimeout(safetyTimer); subscription.unsubscribe(); };
   }, []);
 
   /* ── Load data from Supabase once profile is known ── */
   useEffect(() => {
-    if (!ready || !myId) return;
+    if (!myId) return;
     loadAll();
-  }, [ready, myId]);
+  }, [myId]);
 
   /* ── Persist favorite artists to localStorage ── */
   useEffect(() => { lsSet(LS.FAV_ARTISTS, favoriteArtists); }, [favoriteArtists]);
@@ -1000,11 +1047,10 @@ export default function Noteworthy() {
     setToast({ msg, type }); setTimeout(() => setToast(null), 2600);
   }
 
-  function signOut() {
-    tokenStore.clear();
+  async function signOut() {
     lsClear(LS.PROFILE);
-    setProfile(null); setReviews([]); setLists([]); setFollowing([]);
-    setTab("feed"); setSubPage(null); setModal(null);
+    await supabase.auth.signOut();
+    // onAuthStateChange SIGNED_OUT handles resetting all state
   }
 
   const navigate = (page, data = {}) => setSubPage({ page, ...data });
@@ -1037,12 +1083,12 @@ export default function Noteworthy() {
     await dbDeleteReview(id);
   }
 
-  async function toggleLike(reviewId) {
+  async function toggleLike(reviewId, reviewSnapshot) {
     if (!myId) return;
-    const review = reviews.find(r => r.id === reviewId);
+    const review = reviews.find(r => r.id === reviewId) ?? reviewSnapshot;
     if (!review) return;
     const liked = review.likes?.includes(myId);
-    // Optimistic update
+    // Optimistic update — only mutates main reviews state if the review lives there
     setReviews(p => p.map(r => {
       if (r.id !== reviewId) return r;
       const likes = liked ? r.likes.filter(x => x !== myId) : [...(r.likes || []), myId];
@@ -1119,35 +1165,14 @@ export default function Noteworthy() {
     navigate, toggleLike, addComment, deleteComment,
     setModal, setAlert, deleteReview, deleteList, toggleFollow,
     favoriteArtists, toggleFavoriteArtist,
-    openArtist: artist => setArtistPage(artist),
+    onUpdateProfile: updateProfileField,
   };
 
-  if (!ready) return (
-    <>
-      <style>{CSS}</style>
-      <div className="landing">
-        <div className="landing-inner">
-          <div className="landing-logo"><span className="landing-note">♪</span><span className="landing-wordmark">noteworthy</span></div>
-          <div className="auth-loading"><div className="auth-spin" /><span>Loading…</span></div>
-        </div>
-      </div>
-    </>
-  );
 
   if (!profile) return (
     <>
       <style>{CSS}</style>
-      <div className="landing">
-        <div className="landing-inner">
-          <div className="landing-logo"><span className="landing-note">♪</span><span className="landing-wordmark">noteworthy</span></div>
-          <p className="landing-tagline">Track the music you've heard.<br />Tell your friends what's worth it.</p>
-          <button className="landing-btn" onClick={async () => { window.location.href = await getSpotifyAuthUrl(); }}>
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="#fff"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424a.622.622 0 01-.857.207c-2.348-1.435-5.304-1.76-8.785-.964a.622.622 0 11-.277-1.215c3.809-.87 7.077-.496 9.712 1.115a.623.623 0 01.207.857zm1.223-2.722a.78.78 0 01-1.072.257c-2.687-1.652-6.785-2.131-9.965-1.166a.78.78 0 01-.973-.519.781.781 0 01.519-.972c3.632-1.102 8.147-.568 11.234 1.328a.78.78 0 01.257 1.072zm.105-2.835c-3.223-1.914-8.54-2.09-11.618-1.156a.935.935 0 11-.543-1.79c3.532-1.073 9.404-.865 13.115 1.338a.935.935 0 01-.954 1.608z" /></svg>
-            Continue with Spotify
-          </button>
-          <p className="landing-fine">Noteworthy uses Spotify to power music search.<br />Your listening history is never stored.</p>
-        </div>
-      </div>
+      <AuthPage />
     </>
   );
 
@@ -1173,7 +1198,7 @@ export default function Noteworthy() {
         )}
         {subPage && (
           <div className="subpage-ov">
-            {subPage.page === "reviewDetail" && <ReviewDetailPage review={reviews.find(r => r.id === subPage.reviewId)} {...shared} goBack={goBack} />}
+            {subPage.page === "reviewDetail" && <ReviewDetailPage review={reviews.find(r => r.id === subPage.reviewId) ?? subPage.reviewSnapshot} {...shared} goBack={goBack} />}
             {subPage.page === "profile" && <ProfilePage userId={subPage.userId} {...shared} goBack={goBack} loadUserData={async (uid) => {
               const [uReviews, uLists, uFollowing, uFollowers] = await Promise.all([
                 getUserReviews(uid),
@@ -1194,7 +1219,7 @@ export default function Noteworthy() {
         <div className="nw-main">
           {tab === "feed" && <FeedTab     {...shared} signOut={signOut} dbLoading={dbLoading} />}
           {tab === "discover" && <DiscoverTab {...shared} loadAllReviews={async () => { const rows = await getAllReviews(); return rows.map(normalizeReview); }} loadAllLists={async () => { const rows = await getAllLists(); return rows.map(normalizeList); }} />}
-          {tab === "activity" && <ActivityTab {...shared} />}
+          {tab === "notifications" && <NotificationsTab myId={myId} allUsers={allUsers} navigate={navigate} notifSeen={notifSeen} onLoad={setNotifications} />}
           {tab === "lists" && <ListsTab    {...shared} />}
           {tab === "profile" && <MyProfileTab {...shared} />}
         </div>
@@ -1202,12 +1227,15 @@ export default function Noteworthy() {
           {[
             { id: "feed", label: "Feed", svg: <path d="M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H5a1 1 0 01-1-1V9.5z M9 21V12h6v9" strokeWidth="1.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" /> },
             { id: "discover", label: "Discover", svg: <><circle cx="11" cy="11" r="7" strokeWidth="1.5" fill="none" stroke="currentColor" /><path d="M16.5 16.5L21 21" strokeWidth="1.5" strokeLinecap="round" stroke="currentColor" /></> },
-            { id: "activity", label: "Activity", svg: <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0" strokeWidth="1.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" /> },
+            { id: "notifications", label: "Activity", svg: <path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0" strokeWidth="1.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />, badge: unreadCount },
             { id: "lists", label: "Lists", svg: <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2M9 12h6M9 16h4" strokeWidth="1.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" /> },
             { id: "profile", label: "Profile", svg: <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M12 11a4 4 0 100-8 4 4 0 000 8z" strokeWidth="1.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" /> },
           ].map(t => (
-            <button key={t.id} className={`tab-item ${tab === t.id ? "active" : ""}`} onClick={() => { setTab(t.id); setSubPage(null); }}>
-              <svg viewBox="0 0 24 24" width="23" height="23">{t.svg}</svg>
+            <button key={t.id} className={`tab-item ${tab === t.id ? "active" : ""}`} onClick={() => { setTab(t.id); setSubPage(null); if (t.id === "notifications") markNotifSeen(); }}>
+              <div style={{ position: "relative", display: "inline-flex" }}>
+                <svg viewBox="0 0 24 24" width="23" height="23">{t.svg}</svg>
+                {t.badge > 0 && <span className="tab-badge">{t.badge > 9 ? "9+" : t.badge}</span>}
+              </div>
               <span>{t.label}</span>
             </button>
           ))}
@@ -1283,7 +1311,7 @@ function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike
                   <Avatar user={currentUser} size={36} />
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>{currentUser?.display_name}</div>
-                    <div style={{ fontSize: 12, color: "#555" }}>{currentUser?.id}</div>
+                    <div style={{ fontSize: 12, color: "#555" }}>@{currentUser?.username}</div>
                   </div>
                 </div>
                 <button className="user-menu-item" onClick={() => { setUserMenuOpen(false); signOut(); }}>
@@ -1310,10 +1338,9 @@ function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike
           </div>
         ) : feed.length === 0 ? (
           <>
-            <RecentlyPlayed onReview={item => setModal({ type: "newReviewWithItem", item })} title="Your Recent Listening" />
             <div className="empty-feed" style={{ paddingTop: 32 }}>
               <h2 className="empty-h">Start your diary</h2>
-              <p className="empty-p">Tap any track above to review it, or search for something you've been listening to.</p>
+              <p className="empty-p">Search for something you've been listening to and leave your first review.</p>
               <button className="empty-cta" onClick={() => setModal({ type: "newReview" })}>Write a review</button>
             </div>
           </>
@@ -1347,9 +1374,7 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
     deb.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const token = await ensureToken();
-        if (!token) { setSearching(false); return; }
-        const d = await spSearch(searchQ, "track,album", token);
+        const d = await spSearch(searchQ, "track,album");
         const tracks = (d?.tracks?.items || []).map(t => ({ id: t.id, type: "track", title: t.name, artist: t.artists.map(a => a.name).join(", "), cover: t.album?.images?.[0]?.url, year: t.album?.release_date?.slice(0, 4) }));
         const albums = (d?.albums?.items || []).map(a => ({ id: a.id, type: "album", title: a.name, artist: a.artists.map(x => x.name).join(", "), cover: a.images?.[0]?.url, year: a.release_date?.slice(0, 4) }));
         setSearchResults({ tracks, albums });
@@ -1475,17 +1500,56 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
   );
 }
 
-/* ── Activity Tab ── */
-function ActivityTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike, navigate, setModal, deleteReview }) {
-  const activity = reviews.filter(r => myFollowing.includes(r.userId)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+/* ── Notifications Tab ── */
+function NotificationsTab({ myId, allUsers, navigate, notifSeen, onLoad }) {
+  const [notifs, setNotifs] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!myId) return;
+    getNotifications(myId)
+      .then(data => { setNotifs(data); onLoad?.(data); })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [myId]);
+
   return (
     <div className="screen">
-      <header className="nw-header"><span className="nw-logo">Activity</span></header>
+      <header className="nw-header"><span className="nw-logo">Notifications</span></header>
       <div className="scroll-area">
-        {activity.length === 0
-          ? <div className="empty-feed"><div className="empty-art">🔔</div><h2 className="empty-h">Nothing yet</h2><p className="empty-p">Reviews from people you follow will appear here.</p></div>
-          : activity.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />)
-        }
+        {loading ? (
+          <div style={{ display: "flex", justifyContent: "center", padding: "40px 0" }}>
+            <div className="auth-spin" />
+          </div>
+        ) : notifs.length === 0 ? (
+          <div className="empty-feed">
+            <div className="empty-art">🔔</div>
+            <h2 className="empty-h">No notifications yet</h2>
+            <p className="empty-p">Likes and comments on your reviews will appear here.</p>
+          </div>
+        ) : notifs.map(n => {
+          const actor = allUsers[n.userId];
+          const name = actor?.display_name || actor?.username || "Someone";
+          const isNew = notifSeen && new Date(n.createdAt) > new Date(notifSeen);
+          return (
+            <div key={n.id} className={`notif-item${isNew ? " notif-new" : ""}`}
+              onClick={() => navigate("reviewDetail", { reviewId: n.reviewId })}>
+              <Avatar user={actor} size={38} />
+              <div className="notif-body">
+                <p className="notif-text">
+                  <span className="notif-actor">{name}</span>
+                  {n.type === "like" ? " liked your review of " : " commented on your review of "}
+                  <span className="notif-title">{n.itemTitle}</span>
+                </p>
+                {n.type === "comment" && n.text && (
+                  <p className="notif-quote">"{n.text.length > 80 ? n.text.slice(0, 80) + "…" : n.text}"</p>
+                )}
+                <p className="notif-time">{formatDate(n.createdAt)}</p>
+              </div>
+              <span className="notif-icon">{n.type === "like" ? "♥" : "💬"}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1534,139 +1598,6 @@ function ListCard({ list, allUsers, currentUser, myId, navigate, setModal, setAl
         {list.items.length > 4 && <div className="lc-more">+{list.items.length - 4} more</div>}
       </div>
       {author && <div className="lc-foot"><Avatar user={author} size={16} /><span>{author.display_name || author.id} · {list.items.length} items</span></div>}
-    </div>
-  );
-}
-
-/* ── Spotify Library Shelf ── */
-function LibraryShelf({ title, items, renderCard }) {
-  if (!items || items.length === 0) return null;
-  return (
-    <div style={{ marginBottom: 24 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-        <svg viewBox="0 0 24 24" width="12" height="12" fill="#1DB954" style={{ flexShrink: 0 }}>
-          <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424a.622.622 0 01-.857.207c-2.348-1.435-5.304-1.76-8.785-.964a.622.622 0 11-.277-1.215c3.809-.87 7.077-.496 9.712 1.115a.623.623 0 01.207.857zm1.223-2.722a.78.78 0 01-1.072.257c-2.687-1.652-6.785-2.131-9.965-1.166a.78.78 0 01-.973-.519.781.781 0 01.519-.972c3.632-1.102 8.147-.568 11.234 1.328a.78.78 0 01.257 1.072zm.105-2.835c-3.223-1.914-8.54-2.09-11.618-1.156a.935.935 0 11-.543-1.79c3.532-1.073 9.404-.865 13.115 1.338a.935.935 0 01-.954 1.608z" />
-        </svg>
-        <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text3)", letterSpacing: "1px", textTransform: "uppercase" }}>{title}</span>
-      </div>
-      <div className="lib-shelf-scroll" onMouseDown={e => { const el = e.currentTarget; el.isDragging = false; el.startX = e.clientX; el.scrollStart = el.scrollLeft; el.dataset.drag = "1"; }} onMouseMove={e => { const el = e.currentTarget; if (el.dataset.drag !== "1") return; const dx = e.clientX - el.startX; if (Math.abs(dx) > 4) { el.isDragging = true; el.scrollLeft = el.scrollStart - dx; } }} onMouseUp={e => { e.currentTarget.dataset.drag = "0"; }} onMouseLeave={e => { e.currentTarget.dataset.drag = "0"; }} onClick={e => { if (e.currentTarget.isDragging) e.stopPropagation(); }}>
-        {items.map((item, i) => renderCard(item, i))}
-      </div>
-    </div>
-  );
-}
-
-function SpotifyLibrary({ onReview, onArtist }) {
-  const [recentTracks, setRecentTracks] = useState([]);
-  const [topTracks, setTopTracks] = useState([]);
-  const [topArtists, setTopArtists] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      const token = await ensureToken();
-      if (!token || cancelled) { setLoading(false); return; }
-      try {
-        const [recent, top, artists] = await Promise.all([
-          fetchRecentlyPlayed(token, 20),
-          fetchTopTracks(token, 50),
-          fetchTopArtists(token, 20),
-        ]);
-        if (cancelled) return;
-        if (recent?.items) {
-          const seen = new Set();
-          setRecentTracks(recent.items.filter(({ track }) => {
-            if (seen.has(track.id)) return false;
-            seen.add(track.id); return true;
-          }).slice(0, 12));
-        }
-        if (top?.items) setTopTracks(top.items.slice(0, 12));
-        if (artists?.items) setTopArtists(artists.items.slice(0, 12));
-      } catch (e) { console.error("SpotifyLibrary error", e); }
-      if (!cancelled) setLoading(false);
-    }
-    load();
-    return () => { cancelled = true; };
-  }, []);
-
-  if (loading) return (
-    <div>
-      {["Recently Played", "Top Tracks", "Top Artists"].map(t => (
-        <div key={t} style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text3)", letterSpacing: 1, textTransform: "uppercase", marginBottom: 10 }}>{t}</div>
-          <div style={{ display: "flex", gap: 12, overflowX: "auto", flexWrap: "nowrap", paddingBottom: 6, scrollbarWidth: "none" }}>
-            {[1, 2, 3, 4, 5].map(i => <div key={i} className="rp-skeleton" />)}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-
-  function TrackCard({ track }) {
-    const item = {
-      id: track.id, type: "track", title: track.name,
-      artist: track.artists?.map(a => a.name).join(", "),
-      cover: track.album?.images?.[0]?.url,
-      year: track.album?.release_date?.slice(0, 4),
-    };
-    return (
-      <div style={{ flexShrink: 0, width: 96, cursor: "pointer" }} onClick={() => onReview(item)}>
-        <div style={{ position: "relative", width: 96, height: 96, borderRadius: 6, overflow: "hidden", marginBottom: 7 }}>
-          {item.cover
-            ? <img src={item.cover} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", transition: "transform .25s" }}
-              onMouseEnter={e => e.currentTarget.style.transform = "scale(1.06)"}
-              onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"} />
-            : <div style={{ width: "100%", height: "100%", background: `linear-gradient(135deg,hsl(${(item.title.charCodeAt(0) * 23) % 360},35%,14%),hsl(${((item.title.charCodeAt(0) * 23 + 50) % 360)},30%,9%))` }} />
-          }
-          <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,.5)", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0, transition: "opacity .2s", borderRadius: 6 }}
-            onMouseEnter={e => e.currentTarget.style.opacity = "1"}
-            onMouseLeave={e => e.currentTarget.style.opacity = "0"}>
-            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z" /></svg>
-          </div>
-        </div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.3 }}>{item.title}</div>
-        <div style={{ fontSize: 10, color: "var(--text3)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginTop: 2 }}>{item.artist}</div>
-      </div>
-    );
-  }
-
-  function ArtistCard({ artist }) {
-    const img = artist.images?.[0]?.url;
-    return (
-      <div style={{ flexShrink: 0, width: 88, cursor: "pointer", textAlign: "center" }} onClick={() => onArtist(artist)}>
-        <div style={{ position: "relative", width: 88, height: 88, borderRadius: "50%", overflow: "hidden", marginBottom: 7, background: "var(--s2)" }}>
-          {img
-            ? <img src={img} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", transition: "transform .25s" }}
-              onMouseEnter={e => e.currentTarget.style.transform = "scale(1.07)"}
-              onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"} />
-            : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28 }}>🎵</div>
-          }
-          <div style={{ position: "absolute", inset: 0, borderRadius: "50%", background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0, transition: "opacity .2s" }}
-            onMouseEnter={e => e.currentTarget.style.opacity = "1"}
-            onMouseLeave={e => e.currentTarget.style.opacity = "0"}>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
-          </div>
-        </div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{artist.name}</div>
-        <div style={{ fontSize: 10, color: "var(--text3)", marginTop: 2 }}>
-          {artist.followers?.total ? `${(artist.followers.total / 1000).toFixed(0)}k` : artist.genres?.[0] || ""}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      <LibraryShelf title="Recently Played" items={recentTracks}
-        renderCard={item => <TrackCard key={item.track.id + item.played_at} track={item.track} />}
-      />
-      <LibraryShelf title="Top Tracks This Month" items={topTracks}
-        renderCard={(track, i) => <TrackCard key={track.id} track={track} />}
-      />
-      <LibraryShelf title="Top Artists This Month" items={topArtists}
-        renderCard={(artist) => <ArtistCard key={artist.id} artist={artist} />}
-      />
     </div>
   );
 }
@@ -1787,12 +1718,27 @@ function ArtistPage({ artist, reviews, allUsers, currentUser, myId, favoriteArti
 }
 
 /* ── My Profile Tab ── */
-function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, myFollowing, follows, favoriteArtists, toggleFavoriteArtist, openArtist }) {
-  const [tab, setTab] = useState("activity");
+function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, myFollowing, follows, favoriteArtists, toggleFavoriteArtist, onUpdateProfile }) {
+  const [tab, setTab] = useState("reviews");
+  const [editingName, setEditingName] = useState(false);
+  const [nameVal, setNameVal] = useState("");
+  const [savingName, setSavingName] = useState(false);
+
   const myReviews = reviews.filter(r => r.userId === myId).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const myLists = lists.filter(l => l.userId === myId);
   const myFollowingCount = myFollowing.length;
   const myFollowers = Object.entries(follows).filter(([uid, arr]) => uid !== myId && (Array.isArray(arr) ? arr.includes(myId) : false)).length;
+
+  async function saveName() {
+    const trimmed = nameVal.trim();
+    if (!trimmed || trimmed === currentUser?.display_name) { setEditingName(false); return; }
+    setSavingName(true);
+    await updateDisplayName(myId, trimmed);
+    onUpdateProfile?.({ display_name: trimmed });
+    setSavingName(false);
+    setEditingName(false);
+  }
+
   return (
     <div className="screen">
       <header className="nw-header" style={{ borderBottom: "none" }}><span className="nw-logo" style={{ fontSize: 18 }}>{currentUser?.display_name}</span></header>
@@ -1805,20 +1751,39 @@ function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike,
             ))}
           </div>
         </div>
-        <div className="profile-name">{currentUser?.display_name}</div>
-        {currentUser?.id && <div className="profile-handle">{currentUser.id}</div>}
+
+        {editingName ? (
+          <div className="name-edit-row">
+            <input className="name-edit-input" value={nameVal} onChange={e => setNameVal(e.target.value)}
+              maxLength={40} autoFocus onKeyDown={e => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setEditingName(false); }} />
+            <button className="name-edit-save" onClick={saveName} disabled={savingName}>
+              {savingName ? <span className="auth-spin" style={{ width: 13, height: 13 }} /> : "Save"}
+            </button>
+            <button className="name-edit-cancel" onClick={() => setEditingName(false)}>✕</button>
+          </div>
+        ) : (
+          <div className="name-edit-row">
+            <div className="profile-name" style={{ marginBottom: 0 }}>{currentUser?.display_name}</div>
+            <button className="name-pencil-btn" title="Edit display name"
+              onClick={() => { setNameVal(currentUser?.display_name ?? ""); setEditingName(true); }}>
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
+                <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        {currentUser?.username && <div className="profile-handle">@{currentUser.username}</div>}
         <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
           <button className="profile-act-btn" onClick={() => setModal({ type: "newReview" })}>+ Review</button>
           <button className="profile-act-btn" onClick={() => setModal({ type: "newList" })}>+ List</button>
         </div>
         <div className="seg-ctrl" style={{ overflowX: "auto", flexWrap: "nowrap" }}>
-          {[["activity", "Activity"], ["favorites", `Favorites (${favoriteArtists.length})`], ["reviews", `Reviews (${myReviews.length})`], ["lists", `Lists (${myLists.length})`]].map(([k, l]) => (
+          {[["favorites", `Favorites (${favoriteArtists.length})`], ["reviews", `Reviews (${myReviews.length})`], ["lists", `Lists (${myLists.length})`]].map(([k, l]) => (
             <button key={k} className={`seg-btn ${tab === k ? "active" : ""}`} style={{ whiteSpace: "nowrap", flex: "0 0 auto", padding: "7px 12px" }} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
-        {tab === "activity" && (
-          <SpotifyLibrary onReview={item => setModal({ type: "newReviewWithItem", item })} onArtist={openArtist} />
-        )}
         {tab === "favorites" && <FavoriteArtistsGrid artists={favoriteArtists} onArtist={artist => setModal({ type: "artistPage", artist })} onRemove={toggleFavoriteArtist} />}
         {tab === "reviews" && (myReviews.length === 0 ? <div className="empty-feed"><div className="empty-art">⭐</div><h2 className="empty-h">No reviews yet</h2><button className="empty-cta" onClick={() => setModal({ type: "newReview" })}>Write your first review</button></div> : myReviews.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />))}
         {tab === "lists" && (myLists.length === 0 ? <div className="empty-feed"><div className="empty-art">📋</div><h2 className="empty-h">No lists yet</h2></div> : myLists.map(l => <ListCard key={l.id} list={l} allUsers={allUsers} currentUser={currentUser} myId={myId} navigate={navigate} setModal={setModal} setAlert={setAlert} deleteList={deleteList} />))}
@@ -1855,7 +1820,7 @@ function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFo
     <div className="screen">
       <header className="nw-header" style={{ borderBottom: "none" }}>
         <button className="back-btn" onClick={goBack}><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#007AFF" strokeWidth="2" strokeLinecap="round"><path d="M15 18l-6-6 6-6" /></svg></button>
-        <span className="nw-logo" style={{ fontSize: 17 }}>{user.display_name || user.id}</span>
+        <span className="nw-logo" style={{ fontSize: 17 }}>{user.display_name || user.username}</span>
         <div style={{ width: 32 }} />
       </header>
       <div className="scroll-area">
@@ -1871,7 +1836,7 @@ function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFo
                 ))}
               </div>
             </div>
-            <div className="profile-name">{user.display_name || user.id}</div>
+            <div className="profile-name">{user.display_name || user.username}</div>
             {userId !== myId && <button className={`profile-follow-btn ${isFollowing ? "following" : ""}`} onClick={() => toggleFollow(userId, user)}>{isFollowing ? "Following" : "Follow"}</button>}
             <div className="seg-ctrl">
               {[["reviews", `Reviews (${userReviews.length})`], ["lists", `Lists (${userLists.length})`]].map(([k, l]) => (
@@ -1915,7 +1880,7 @@ function ReviewDetailPage({ review, reviews, allUsers, currentUser, myId, toggle
         {author && <button className="rd-author" onClick={() => navigate("profile", { userId: author.id })}><Avatar user={author} size={28} /><div><div style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>{author.display_name || author.id}</div><div style={{ fontSize: 12, color: "#555" }}>{formatDate(live.createdAt)}</div></div></button>}
         {live.text && <div className="rd-body" dangerouslySetInnerHTML={{ __html: live.text }} />}
         <div className="rd-acts">
-          <button className={`rc-act ${liked ? "liked" : ""}`} onClick={() => toggleLike(live.id)}>
+          <button className={`rc-act ${liked ? "liked" : ""}`} onClick={() => toggleLike(live.id, live)}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill={liked ? "#E9463F" : "none"} stroke={liked ? "#E9463F" : "#555"} strokeWidth="2" strokeLinecap="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" /></svg>
             {live.likes?.length || 0} {live.likes?.length === 1 ? "like" : "likes"}
           </button>
@@ -1987,6 +1952,16 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .landing-btn{display:flex;align-items:center;gap:10px;background:#1DB954;color:#000;border:none;font-family:var(--font);font-size:16px;font-weight:700;padding:14px 28px;border-radius:50px;cursor:pointer;transition:transform .15s,box-shadow .15s;box-shadow:0 4px 20px rgba(29,185,84,.35)}
 .landing-btn:hover{transform:scale(1.04);box-shadow:0 6px 28px rgba(29,185,84,.5)}
 .landing-fine{font-size:12px;color:var(--text4);line-height:1.5}
+.auth-form{display:flex;flex-direction:column;gap:10px;width:100%}
+.auth-input{background:var(--s2);border:1px solid var(--border2);border-radius:8px;padding:13px 14px;color:var(--text);font-family:var(--font);font-size:15px;outline:none;transition:border-color .15s;width:100%}
+.auth-input:focus{border-color:var(--green)}
+.auth-input::placeholder{color:var(--text4)}
+.auth-submit{background:var(--green);color:#000;border:none;font-family:var(--font);font-size:15px;font-weight:700;padding:14px;border-radius:8px;cursor:pointer;transition:opacity .15s;display:flex;align-items:center;justify-content:center;min-height:48px}
+.auth-submit:hover{opacity:.88}
+.auth-submit:disabled{opacity:.5;cursor:not-allowed}
+.auth-error{font-size:13px;color:var(--red);text-align:center;margin:0}
+.auth-toggle{font-size:13px;color:var(--text3);text-align:center}
+.auth-toggle-btn{background:none;border:none;color:var(--green);font-family:var(--font);font-size:13px;font-weight:600;cursor:pointer;padding:0;text-decoration:underline}
 .auth-loading{display:flex;align-items:center;gap:12px;color:var(--text2);font-size:15px}
 .auth-spin{width:20px;height:20px;border:2px solid var(--s3);border-top-color:var(--green);border-radius:50%;animation:spin .8s linear infinite}
 .nw-app{max-width:430px;margin:0 auto;min-height:100vh;background:var(--bg);position:relative}
@@ -2209,4 +2184,24 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .nw-toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);background:var(--s2);color:var(--text);font-family:var(--font);font-size:13px;font-weight:600;padding:10px 18px;border-radius:4px;z-index:600;box-shadow:0 4px 20px rgba(0,0,0,.5);animation:slideUp .2s ease;white-space:nowrap;letter-spacing:.2px}
 .nw-toast.success{background:rgba(0,192,48,.15);color:var(--green);border:1px solid rgba(0,192,48,.25)}
 .nw-toast.info{background:var(--s2);color:var(--text3)}
+.tab-badge{position:absolute;top:-5px;right:-7px;min-width:16px;height:16px;padding:0 4px;background:var(--green);color:#000;font-size:9px;font-weight:800;border-radius:8px;display:flex;align-items:center;justify-content:center;line-height:1;pointer-events:none}
+.notif-item{display:flex;align-items:flex-start;gap:12px;padding:13px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s}
+.notif-item:hover{background:var(--s2)}
+.notif-item.notif-new{background:rgba(0,192,48,.05)}
+.notif-body{flex:1;min-width:0}
+.notif-text{font-size:13px;color:var(--text2);line-height:1.45;margin-bottom:3px}
+.notif-actor{font-weight:700;color:var(--text)}
+.notif-title{font-weight:600;color:var(--text)}
+.notif-quote{font-size:12px;color:var(--text3);font-style:italic;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.notif-time{font-size:11px;color:var(--text4)}
+.notif-icon{font-size:14px;flex-shrink:0;padding-top:1px;color:var(--text3)}
+.notif-item.notif-new .notif-icon{color:var(--green)}
+.name-edit-row{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+.name-edit-input{background:var(--s2);border:1px solid var(--green);border-radius:5px;color:var(--text);font-family:var(--serif);font-size:19px;font-weight:700;font-style:italic;padding:3px 9px;outline:none;min-width:0;flex:1;max-width:240px}
+.name-edit-save{background:var(--green);border:none;color:#000;font-family:var(--font);font-size:12px;font-weight:700;padding:5px 11px;border-radius:4px;cursor:pointer;display:flex;align-items:center;gap:5px}
+.name-edit-save:disabled{opacity:.5;cursor:not-allowed}
+.name-edit-cancel{background:none;border:none;color:var(--text4);font-size:16px;cursor:pointer;padding:4px;line-height:1;transition:color .12s}
+.name-edit-cancel:hover{color:var(--text2)}
+.name-pencil-btn{background:none;border:none;color:var(--text4);cursor:pointer;padding:4px;display:flex;align-items:center;transition:color .12s;flex-shrink:0}
+.name-pencil-btn:hover{color:var(--green)}
 `;
