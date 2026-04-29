@@ -25,6 +25,7 @@ import {
   subscribeToFeed,
   getNotifications,
   updateDisplayName,
+  uploadAvatar,
 } from "./db.js";
 
 /* ── iTunes Search (no auth, no API key required) ── */
@@ -182,7 +183,7 @@ async function authSignIn(usernameOrEmail, password) {
   if (!email.includes("@")) {
     const { data: row } = await supabase
       .from("users").select("email").eq("username", email).maybeSingle();
-    if (!row) throw new Error("No account found for that username");
+    if (!row || !row.email) throw new Error("No account found for that username. Try signing in with your email address instead.");
     email = row.email;
   }
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
@@ -260,7 +261,7 @@ function genId(prefix) { return prefix + Date.now() + Math.random().toString(36)
 
 /* ── UI Components ── */
 function Avatar({ user, size = 36 }) {
-  const img = user?.images?.[0]?.url;
+  const img = user?.avatar_url || user?.images?.[0]?.url;
   if (img) return <img src={img} alt="" style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0, display: "block" }} />;
   const palette = ["#007AFF", "#34C759", "#FF9500", "#FF2D55", "#AF52DE", "#5AC8FA"];
   const name = user?.display_name || user?.name || "?";
@@ -484,9 +485,15 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
     <div className="subpage-ov" style={{ display: "flex", flexDirection: "column" }}>
       {/* Header */}
       <header className="nw-header" style={{ flexShrink: 0 }}>
-        <button className="back-btn" onClick={onClose}>
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#007AFF" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-        </button>
+        {item && !isEdit ? (
+          <button className="back-btn" onClick={() => setItem(null)}>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#007AFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 5l-7 7 7 7" /></svg>
+          </button>
+        ) : (
+          <button className="back-btn" onClick={onClose}>
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#007AFF" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+          </button>
+        )}
         <span className="nw-logo" style={{ fontSize: 17 }}>{isEdit ? "Edit Review" : item ? "Write a Review" : "Find Music"}</span>
         <div style={{ width: 32 }} />
       </header>
@@ -523,7 +530,7 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
 
             {/* Results */}
             {searchList.map(r => (
-              <button key={r.id} className="isb-row" style={{ borderRadius: 8, marginBottom: 6, border: "1px solid var(--border)", padding: "12px 14px" }} onClick={() => { setItem(r); setSearchQ(""); setSearchRes(null); }}>
+              <button key={r.id} className="isb-row" style={{ borderRadius: 8, marginBottom: 6, border: "1px solid var(--border)", padding: "12px 14px" }} onClick={() => setItem(r)}>
                 <CoverWithPreview item={r} size={48} />
                 <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
                   <div className="isb-name" style={{ fontSize: 15, maxWidth: "100%" }}>{r.title}</div>
@@ -567,9 +574,6 @@ function WriteReviewScreen({ initItem = null, initStars = 0, initText = "", isEd
                 <div style={{ fontFamily: "var(--serif)", fontSize: 20, fontStyle: "italic", color: "var(--text)", lineHeight: 1.2, marginBottom: 4 }}>{item.title}</div>
                 <div style={{ fontSize: 14, color: "var(--text2)", marginBottom: 2 }}>{item.artist}</div>
                 <div style={{ fontSize: 12, color: "var(--text3)" }}>{item.type === "album" ? "Album" : "Track"}{item.year ? ` · ${item.year}` : ""}</div>
-                {!isEdit && (
-                  <button onClick={() => setItem(null)} style={{ marginTop: 8, background: "none", border: "none", color: "var(--text4)", fontSize: 12, cursor: "pointer", padding: 0 }}>← Change</button>
-                )}
               </div>
             </div>
 
@@ -747,6 +751,22 @@ function ListScreen({ initList = null, isEdit = false, onSubmit, onClose }) {
 }
 
 
+function PhotoLightbox({ src, name, onClose }) {
+  useEffect(() => {
+    const fn = e => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", fn);
+    return () => document.removeEventListener("keydown", fn);
+  }, [onClose]);
+  return (
+    <div className="lightbox-bg" onClick={onClose}>
+      <button className="lightbox-close" onClick={onClose}>
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+      </button>
+      <img src={src} alt={name || ""} className="lightbox-img" onClick={e => e.stopPropagation()} />
+    </div>
+  );
+}
+
 function Alert({ title, message, actions, onClose }) {
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.75)", zIndex: 500, display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(12px)", animation: "fadeIn .15s ease" }}>
@@ -769,7 +789,7 @@ function Alert({ title, message, actions, onClose }) {
   );
 }
 
-function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdit, onDelete }) {
+function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdit, onDelete, setArtistPage }) {
   // Fall back to a minimal author object so the card always renders
   const author = allUsers[review.userId] || { id: review.userId, display_name: review.userId?.slice(0, 8) || "User", images: [] };
   const liked = review.likes?.includes(currentUser?.id);
@@ -792,7 +812,12 @@ function ReviewCard({ review, currentUser, allUsers, toggleLike, navigate, onEdi
       <div className="rc-body">
         <div className="rc-track-row" onClick={() => navigate("reviewDetail", { reviewId: review.id, reviewSnapshot: review })}>
           <div className="rc-track-name">{review.item.title}</div>
-          <div className="rc-track-sub">{review.item.artist}{review.item.year ? ` · ${review.item.year}` : ""}</div>
+          <div className="rc-track-sub">
+            {setArtistPage && review.item.artist
+              ? <button className="rc-artist-link" onClick={e => { e.stopPropagation(); setArtistPage({ name: review.item.artist, id: review.item.artist }); }}>{review.item.artist}</button>
+              : review.item.artist}
+            {review.item.year ? ` · ${review.item.year}` : ""}
+          </div>
         </div>
         <div className="rc-meta-row">
           <button className="rc-author" onClick={() => navigate("profile", { userId: review.userId })}>
@@ -932,6 +957,10 @@ function AuthPage() {
   );
 }
 
+// Module-level guard — prevents duplicate onAuthStateChange subscriptions
+// from Vite HMR re-executing the module during development.
+let _authSubscription = null;
+
 export default function Noteworthy() {
   const [profile, setProfile] = useState(() => lsGet(LS.PROFILE));
   const [reviews, setReviews] = useState([]);
@@ -968,58 +997,90 @@ export default function Noteworthy() {
 
   /* ── Boot sequence ── */
   useEffect(() => {
-    // We never call getSession() — it waits for Supabase's internal initialize()
-    // promise, which makes a network call when there's a stored session with an
-    // expired token. That call can hang indefinitely, causing an infinite loading screen.
-    //
-    // Instead: render immediately from the localStorage cache (ready=true from init),
-    // and let onAuthStateChange fire INITIAL_SESSION once Supabase is done.
-    //
-    // Safety valve: if initialize() hasn't resolved in 5 seconds, directly delete
-    // the auth token key from localStorage (bypasses the SDK — no SDK call hangs here)
-    // and clear the profile so the user lands on the sign-in page.
-    let supabaseReady = false;
+    let mounted = true;
 
-    const safetyTimer = setTimeout(() => {
-      if (supabaseReady) return;
-      console.warn("Supabase init timed out — wiping stored auth token");
-      Object.keys(localStorage)
-        .filter(k => k.startsWith("sb-") && k.endsWith("-auth-token"))
-        .forEach(k => localStorage.removeItem(k));
-      lsClear(LS.PROFILE);
-      setProfile(null);
-    }, 5000);
+    // Tear down any subscription left over from a previous HMR cycle
+    if (_authSubscription) { _authSubscription.unsubscribe(); _authSubscription = null; }
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      supabaseReady = true;
-      clearTimeout(safetyTimer);
-
-      if (event === "INITIAL_SESSION") {
-        if (session) {
-          try {
-            await ensureProfileRow(session);
-            const prof = await fetchUserProfile(session.user.id);
-            if (prof) { setProfile(prof); lsSet(LS.PROFILE, prof); }
-            else { lsClear(LS.PROFILE); setProfile(null); }
-          } catch (e) { console.error("profile hydration error", e); }
-        } else {
-          lsClear(LS.PROFILE);
-          setProfile(null);
-        }
-      } else if (event === "SIGNED_IN" && session) {
-        try {
-          await ensureProfileRow(session);
-          const prof = await fetchUserProfile(session.user.id);
-          if (prof) { setProfile(prof); lsSet(LS.PROFILE, prof); }
-        } catch (e) { console.error("sign-in error", e); }
+    // Subscribe to future auth events (sign-in, sign-out, token refresh).
+    // We do NOT handle INITIAL_SESSION here — boot() below calls getSession() directly,
+    // which is simpler, race-condition-free, and works identically in dev and prod.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      if (event === "SIGNED_IN" && session) {
+        // User just signed in from the auth page — show minimal profile immediately
+        const meta = session.user.user_metadata ?? {};
+        const minimal = {
+          id: session.user.id,
+          username: meta.username ?? session.user.email,
+          display_name: meta.display_name ?? meta.username ?? session.user.email,
+          email: session.user.email,
+          avatar_url: null,
+        };
+        setProfile(minimal);
+        lsSet(LS.PROFILE, minimal);
+        // Hydrate full profile in the background
+        ensureProfileRow(session)
+          .then(() => fetchUserProfile(session.user.id))
+          .then(prof => { if (mounted && prof) { setProfile(prof); lsSet(LS.PROFILE, prof); } })
+          .catch(e => console.error("sign-in hydration", e));
       } else if (event === "SIGNED_OUT") {
         lsClear(LS.PROFILE);
         setProfile(null); setReviews([]); setLists([]); setFollowing([]);
         setTab("feed"); setSubPage(null); setModal(null);
       }
+      // TOKEN_REFRESHED: session silently renewed — nothing to do
     });
+    _authSubscription = subscription;
 
-    return () => { clearTimeout(safetyTimer); subscription.unsubscribe(); };
+    // Resolve the current session on startup with a 12-second timeout.
+    // getSession() waits for Supabase's internal init (which includes token refresh
+    // if the stored token is expired). Without a custom fetch timeout interfering,
+    // this completes in < 2 seconds on any reasonable connection.
+    async function boot() {
+      try {
+        const outcome = await Promise.race([
+          supabase.auth.getSession().then(r => ({ session: r.data.session })),
+          new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 12000)),
+        ]);
+
+        if (!mounted) return;
+
+        if (outcome.timedOut) {
+          console.warn("Supabase session check timed out — clearing stored session");
+          Object.keys(localStorage)
+            .filter(k => k.startsWith("sb-") && k.endsWith("-auth-token"))
+            .forEach(k => localStorage.removeItem(k));
+          lsClear(LS.PROFILE);
+          setProfile(null);
+          return;
+        }
+
+        const { session } = outcome;
+        if (session) {
+          try {
+            await ensureProfileRow(session);
+            const prof = await fetchUserProfile(session.user.id);
+            if (!mounted) return;
+            if (prof) { setProfile(prof); lsSet(LS.PROFILE, prof); }
+            else { lsClear(LS.PROFILE); setProfile(null); }
+          } catch (e) {
+            // Network error — keep the cached profile so the user isn't logged out
+            // spuriously. If the session is truly invalid, SIGNED_OUT will fire.
+            console.error("profile hydration error", e);
+          }
+        } else {
+          lsClear(LS.PROFILE);
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("boot error", e);
+      }
+    }
+
+    boot();
+
+    return () => { mounted = false; subscription.unsubscribe(); _authSubscription = null; };
   }, []);
 
   /* ── Load data from Supabase once profile is known ── */
@@ -1081,10 +1142,12 @@ export default function Noteworthy() {
     setToast({ msg, type }); setTimeout(() => setToast(null), 2600);
   }
 
-  async function signOut() {
+  function signOut() {
+    // Clear state immediately so the UI responds right away
     lsClear(LS.PROFILE);
-    await supabase.auth.signOut();
-    // onAuthStateChange SIGNED_OUT handles resetting all state
+    setProfile(null); setReviews([]); setLists([]); setFollowing([]);
+    setTab("feed"); setSubPage(null); setModal(null);
+    supabase.auth.signOut(); // fire and forget — event will be a no-op since state is already cleared
   }
 
   const navigate = (page, data = {}) => setSubPage({ page, ...data });
@@ -1193,6 +1256,8 @@ export default function Noteworthy() {
   }
 
   /* ── Shared props ── */
+  function goHome() { setTab("feed"); setSubPage(null); setArtistPage(null); }
+
   const shared = {
     reviews, lists, allUsers, currentUser: profile, myId,
     myFollowing: following, follows: { [myId]: following },
@@ -1200,6 +1265,7 @@ export default function Noteworthy() {
     setModal, setAlert, deleteReview, deleteList, toggleFollow,
     favoriteArtists, toggleFavoriteArtist,
     onUpdateProfile: updateProfileField,
+    setArtistPage, setTab, goHome,
   };
 
 
@@ -1250,8 +1316,9 @@ export default function Noteworthy() {
             {subPage.page === "listDetail" && <ListDetailPage list={lists.find(l => l.id === subPage.listId)} {...shared} goBack={goBack} />}
           </div>
         )}
+        <TopBar currentUser={profile} goHome={goHome} setModal={setModal} setTab={setTab} signOut={signOut} />
         <div className="nw-main">
-          {tab === "feed" && <FeedTab     {...shared} signOut={signOut} dbLoading={dbLoading} />}
+          {tab === "feed" && <FeedTab     {...shared} dbLoading={dbLoading} />}
           {tab === "discover" && <DiscoverTab {...shared} loadAllReviews={async () => { const rows = await getAllReviews(); return rows.map(normalizeReview); }} loadAllLists={async () => { const rows = await getAllLists(); return rows.map(normalizeList); }} />}
           {tab === "notifications" && <NotificationsTab myId={myId} allUsers={allUsers} navigate={navigate} notifSeen={notifSeen} onLoad={setNotifications} />}
           {tab === "lists" && <ListsTab    {...shared} />}
@@ -1313,8 +1380,8 @@ export default function Noteworthy() {
   );
 }
 
-/* ── Feed Tab ── */
-function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike, navigate, setModal, deleteReview, signOut, dbLoading }) {
+/* ── Global Top Bar ── */
+function TopBar({ currentUser, goHome, setModal, setTab, signOut }) {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const menuRef = useRef(null);
   useEffect(() => {
@@ -1322,41 +1389,47 @@ function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike
     document.addEventListener("mousedown", fn);
     return () => document.removeEventListener("mousedown", fn);
   }, []);
+  return (
+    <header className="nw-topbar">
+      <button className="nw-logo-btn" onClick={goHome}>noteworthy</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <button className="header-btn" onClick={() => setModal({ type: "newReview" })}>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+          Review
+        </button>
+        <div ref={menuRef} style={{ position: "relative" }}>
+          <button className="avatar-btn" onClick={() => setUserMenuOpen(v => !v)}>
+            <Avatar user={currentUser} size={32} />
+            <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="#888" strokeWidth="2.5" strokeLinecap="round"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+          {userMenuOpen && (
+            <div className="user-menu">
+              <button className="user-menu-info" onClick={() => { setUserMenuOpen(false); setTab("profile"); }}>
+                <Avatar user={currentUser} size={36} />
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>{currentUser?.display_name}</div>
+                  <div style={{ fontSize: 12, color: "#555" }}>@{currentUser?.username}</div>
+                </div>
+              </button>
+              <button className="user-menu-item" onClick={() => { setUserMenuOpen(false); signOut(); }}>
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" /></svg>
+                Sign out
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* ── Feed Tab ── */
+function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike, navigate, setModal, deleteReview, dbLoading, setArtistPage }) {
   const feed = reviews
     .filter(r => r.userId === myId || myFollowing.includes(r.userId))
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   return (
     <div className="screen">
-      <header className="nw-header">
-        <span className="nw-logo">noteworthy</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button className="header-btn" onClick={() => setModal({ type: "newReview" })}>
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
-            Review
-          </button>
-          <div ref={menuRef} style={{ position: "relative" }}>
-            <button className="avatar-btn" onClick={() => setUserMenuOpen(v => !v)}>
-              <Avatar user={currentUser} size={32} />
-              <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="#888" strokeWidth="2.5" strokeLinecap="round"><path d="M6 9l6 6 6-6" /></svg>
-            </button>
-            {userMenuOpen && (
-              <div className="user-menu">
-                <div className="user-menu-info">
-                  <Avatar user={currentUser} size={36} />
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>{currentUser?.display_name}</div>
-                    <div style={{ fontSize: 12, color: "#555" }}>@{currentUser?.username}</div>
-                  </div>
-                </div>
-                <button className="user-menu-item" onClick={() => { setUserMenuOpen(false); signOut(); }}>
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" /></svg>
-                  Sign out
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      </header>
       <div className="sticky-search">
         <div className="isb-wrap">
           <div className="isb-field" style={{ cursor: "pointer" }} onClick={() => setModal({ type: "newReview" })}>
@@ -1379,7 +1452,7 @@ function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike
             </div>
           </>
         ) : (
-          feed.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />)
+          feed.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} setArtistPage={setArtistPage} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />)
         )}
       </div>
     </div>
@@ -1387,7 +1460,7 @@ function FeedTab({ reviews, allUsers, currentUser, myId, myFollowing, toggleLike
 }
 
 /* ── Discover Tab ── */
-function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggleLike, navigate, setModal, toggleFollow, loadAllReviews, loadAllLists }) {
+function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggleLike, navigate, setModal, toggleFollow, loadAllReviews, loadAllLists, setArtistPage }) {
   const [mainTab, setMainTab] = useState("music");
   const [peopleQ, setPeopleQ] = useState("");
   const [searchResults, setSearchResults] = useState(null);
@@ -1399,7 +1472,12 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
   const deb = useRef(null);
 
   useEffect(() => {
-    loadAllReviews().then(rows => { setCommunity(rows.slice(0, 20)); setCommunityLoaded(true); });
+    loadAllReviews()
+      .then(rows => {
+        setCommunity(rows.filter(r => r.userId !== myId).slice(0, 20));
+      })
+      .catch(() => {})
+      .finally(() => setCommunityLoaded(true));
   }, []);
 
   useEffect(() => {
@@ -1438,13 +1516,12 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
 
   return (
     <div className="screen">
-      <header className="nw-header"><span className="nw-logo">Discover</span></header>
       <div className="sticky-search">
         {mainTab === "music" ? (
           <div className="isb-wrap">
             <div className="isb-field">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="M16.5 16.5L21 21" /></svg>
-              <input className="isb-input" placeholder="Search Spotify to review…" value={searchQ} onChange={e => setSearchQ(e.target.value)} />
+              <input className="isb-input" placeholder="Search music to review…" value={searchQ} onChange={e => setSearchQ(e.target.value)} />
               {searching && <div className="isb-spin" />}
               {searchQ && !searching && <button className="isb-x" onClick={() => { setSearchQ(""); setSearchResults(null); }}>✕</button>}
             </div>
@@ -1453,7 +1530,7 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
           <div className="isb-wrap">
             <div className="isb-field">
               <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="M16.5 16.5L21 21" /></svg>
-              <input className="isb-input" placeholder="Search by name or Spotify username…" value={peopleQ} onChange={e => setPeopleQ(e.target.value)} />
+              <input className="isb-input" placeholder="Search by name or username…" value={peopleQ} onChange={e => setPeopleQ(e.target.value)} />
               {peopleSearching && <div className="isb-spin" />}
             </div>
           </div>
@@ -1478,7 +1555,7 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
                 </div>
                 {displayed.map(item => (
                   <div key={item.id} className="search-res-row">
-                    <CoverArt item={item} size={44} />
+                    <CoverWithPreview item={item} size={44} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div className="srr-title">{item.title}</div>
                       <div className="srr-meta">{item.artist}{item.year ? ` · ${item.year}` : ""}</div>
@@ -1496,7 +1573,7 @@ function DiscoverTab({ allUsers, currentUser, myId, myFollowing, follows, toggle
                   ? <div style={{ display: "flex", justifyContent: "center", padding: 20 }}><div className="auth-spin" /></div>
                   : community.length === 0
                     ? <div className="empty-inline">No reviews yet — be the first!</div>
-                    : community.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={() => { }} onDelete={() => { }} />)
+                    : community.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} setArtistPage={setArtistPage} onEdit={() => { }} onDelete={() => { }} />)
                 }
               </>
             )}
@@ -1539,15 +1616,17 @@ function NotificationsTab({ myId, allUsers, navigate, notifSeen, onLoad }) {
 
   useEffect(() => {
     if (!myId) return;
+    let done = false;
+    const bail = setTimeout(() => { if (!done) setLoading(false); }, 12000);
     getNotifications(myId)
       .then(data => { setNotifs(data); onLoad?.(data); })
       .catch(() => {})
-      .finally(() => setLoading(false));
+      .finally(() => { done = true; clearTimeout(bail); setLoading(false); });
+    return () => clearTimeout(bail);
   }, [myId]);
 
   return (
     <div className="screen">
-      <header className="nw-header"><span className="nw-logo">Notifications</span></header>
       <div className="scroll-area">
         {loading ? (
           <div style={{ display: "flex", justifyContent: "center", padding: "40px 0" }}>
@@ -1591,17 +1670,18 @@ function NotificationsTab({ myId, allUsers, navigate, notifSeen, onLoad }) {
 function ListsTab({ lists, allUsers, currentUser, myId, navigate, setModal, setAlert, deleteList }) {
   return (
     <div className="screen">
-      <header className="nw-header">
-        <span className="nw-logo">Lists</span>
-        <button className="header-btn" onClick={() => setModal({ type: "newList" })}>
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
-          New list
-        </button>
-      </header>
       <div className="scroll-area">
         {lists.length === 0
           ? <div className="empty-feed"><div className="empty-art">📋</div><h2 className="empty-h">No lists yet</h2><p className="empty-p">Create a ranked list of your favorites.</p><button className="empty-cta" onClick={() => setModal({ type: "newList" })}>Create a list</button></div>
-          : lists.map(l => <ListCard key={l.id} list={l} allUsers={allUsers} currentUser={currentUser} myId={myId} navigate={navigate} setModal={setModal} setAlert={setAlert} deleteList={deleteList} />)
+          : <>
+              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+                <button className="header-btn" onClick={() => setModal({ type: "newList" })}>
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+                  New list
+                </button>
+              </div>
+              {lists.map(l => <ListCard key={l.id} list={l} allUsers={allUsers} currentUser={currentUser} myId={myId} navigate={navigate} setModal={setModal} setAlert={setAlert} deleteList={deleteList} />)}
+            </>
         }
       </div>
     </div>
@@ -1634,49 +1714,86 @@ function ListCard({ list, allUsers, currentUser, myId, navigate, setModal, setAl
   );
 }
 
+/* ── Favorite Artist Card (self-fetches photo if missing) ── */
+function FavoriteArtistCard({ artist, onArtist, onRemove }) {
+  const [img, setImg] = useState(artist.images?.[0]?.url ?? null);
+  const fetchedRef = useRef(false);
+
+  useEffect(() => {
+    if (fetchedRef.current || img) return;
+    fetchedRef.current = true;
+    fetchArtistImage(artist.name).then(url => { if (url) setImg(url); });
+  }, [artist.name, img]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: "pointer", position: "relative" }}
+      onClick={() => onArtist(artist)}>
+      <button
+        onClick={e => { e.stopPropagation(); onRemove(artist); }}
+        style={{ position: "absolute", top: -4, right: -4, width: 20, height: 20, borderRadius: "50%", background: "var(--s3)", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1, color: "var(--text3)", fontSize: 10 }}>
+        ✕
+      </button>
+      <div style={{ width: 90, height: 90, borderRadius: "50%", overflow: "hidden", background: "var(--s2)", border: "2px solid var(--border2)" }}>
+        {img
+          ? <img src={img} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+          : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32 }}>🎵</div>
+        }
+      </div>
+      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", textAlign: "center", lineHeight: 1.3, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{artist.name}</div>
+      {artist.genres?.[0] && <div style={{ fontSize: 10, color: "var(--text4)", textAlign: "center" }}>{artist.genres[0]}</div>}
+    </div>
+  );
+}
+
 /* ── Favorite Artists Grid ── */
 function FavoriteArtistsGrid({ artists, onArtist, onRemove }) {
   if (!artists.length) return (
     <div className="empty-feed">
       <div className="empty-art">🎤</div>
       <h2 className="empty-h">No favorite artists yet</h2>
-      <p className="empty-p">Tap any artist in your Activity tab to open their page, then favorite them.</p>
+      <p className="empty-p">Tap any artist name on a review to open their page, then favorite them.</p>
     </div>
   );
   return (
     <div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, padding: "4px 0 24px" }}>
-        {artists.map(artist => {
-          const img = artist.images?.[0]?.url;
-          return (
-            <div key={artist.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: "pointer", position: "relative" }}
-              onClick={() => onArtist(artist)}>
-              {/* Remove button */}
-              <button
-                onClick={e => { e.stopPropagation(); onRemove(artist); }}
-                style={{ position: "absolute", top: -4, right: -4, width: 20, height: 20, borderRadius: "50%", background: "var(--s3)", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1, color: "var(--text3)", fontSize: 10 }}>
-                ✕
-              </button>
-              <div style={{ width: 90, height: 90, borderRadius: "50%", overflow: "hidden", background: "var(--s2)", border: "2px solid var(--border2)" }}>
-                {img
-                  ? <img src={img} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-                  : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32 }}>🎵</div>
-                }
-              </div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", textAlign: "center", lineHeight: 1.3, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{artist.name}</div>
-              {artist.genres?.[0] && <div style={{ fontSize: 10, color: "var(--text4)", textAlign: "center" }}>{artist.genres[0]}</div>}
-            </div>
-          );
-        })}
+        {artists.map(artist => (
+          <FavoriteArtistCard key={artist.id} artist={artist} onArtist={onArtist} onRemove={onRemove} />
+        ))}
       </div>
     </div>
   );
 }
 
+/* ── Fetch artist photo from Wikipedia (CORS-safe, no API key needed) ── */
+async function fetchArtistImage(name) {
+  try {
+    const url = `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(name)}&prop=pageimages&format=json&pithumbsize=600&origin=*`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const json = await res.json();
+    const pages = json.query?.pages;
+    if (!pages) return null;
+    const page = Object.values(pages)[0];
+    return page?.thumbnail?.source ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /* ── Artist Page ── */
 function ArtistPage({ artist, reviews, allUsers, currentUser, myId, favoriteArtists, toggleFavoriteArtist, navigate, toggleLike, setModal, deleteReview, goBack }) {
   const isFav = favoriteArtists.some(a => a.id === artist.id);
-  const img = artist.images?.[0]?.url;
+  const [photo, setPhoto] = useState(artist.images?.[0]?.url ?? null);
+  const fetchedRef = useRef(false);
+
+  useEffect(() => {
+    if (fetchedRef.current || artist.images?.[0]?.url) return;
+    fetchedRef.current = true;
+    fetchArtistImage(artist.name).then(url => { if (url) setPhoto(url); });
+  }, [artist.name, artist.images]);
+
+  const img = photo;
 
   // Find all reviews mentioning this artist
   const artistReviews = reviews
@@ -1702,7 +1819,7 @@ function ArtistPage({ artist, reviews, allUsers, currentUser, myId, favoriteArti
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round"><path d="M15 18l-6-6 6-6" /></svg>
           </button>
           <button
-            onClick={() => toggleFavoriteArtist(artist)}
+            onClick={() => toggleFavoriteArtist(photo ? { ...artist, images: [{ url: photo }] } : artist)}
             style={{ background: isFav ? "var(--red)" : "rgba(0,0,0,.4)", border: isFav ? "none" : "1px solid rgba(255,255,255,.3)", borderRadius: 20, padding: "7px 14px", display: "flex", alignItems: "center", gap: 6, cursor: "pointer", transition: "all .15s" }}>
             <svg viewBox="0 0 24 24" width="14" height="14" fill={isFav ? "#fff" : "none"} stroke="#fff" strokeWidth="2" strokeLinecap="round">
               <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" />
@@ -1749,12 +1866,166 @@ function ArtistPage({ artist, reviews, allUsers, currentUser, myId, favoriteArti
   );
 }
 
+/* ── Avatar crop helpers ── */
+function getCroppedBlob(imageSrc, pan, totalScale, rotation, containerSize, outputSize) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = outputSize; canvas.height = outputSize;
+      const ctx = canvas.getContext('2d');
+      const s = outputSize / containerSize;
+      ctx.beginPath();
+      ctx.arc(outputSize / 2, outputSize / 2, outputSize / 2, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.translate(outputSize / 2 + pan.x * s, outputSize / 2 + pan.y * s);
+      ctx.rotate(rotation * Math.PI / 180);
+      ctx.scale(totalScale * s, totalScale * s);
+      ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+      canvas.toBlob(resolve, 'image/jpeg', 0.92);
+    };
+    img.src = imageSrc;
+  });
+}
+
+function AvatarCropModal({ imageFile, onSave, onClose }) {
+  const [imageSrc] = useState(() => URL.createObjectURL(imageFile));
+  const [naturalSize, setNaturalSize] = useState(null);
+  const [zoom, setZoom] = useState(1);
+  const [rotation, setRotation] = useState(0);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [saving, setSaving] = useState(false);
+  const containerRef = useRef(null);
+  const lastPos = useRef(null);
+  const CONTAINER = 280, OUTPUT = 400;
+
+  useEffect(() => () => URL.revokeObjectURL(imageSrc), [imageSrc]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    function onDown(e) {
+      e.preventDefault();
+      lastPos.current = { x: e.clientX, y: e.clientY };
+      function onMove(mv) {
+        setPan(prev => {
+          const next = { x: prev.x + mv.clientX - lastPos.current.x, y: prev.y + mv.clientY - lastPos.current.y };
+          lastPos.current = { x: mv.clientX, y: mv.clientY };
+          return next;
+        });
+      }
+      function onUp() {
+        lastPos.current = null;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    }
+    el.addEventListener('mousedown', onDown);
+    return () => el.removeEventListener('mousedown', onDown);
+  }, []);
+
+  const baseScale = naturalSize ? Math.max(CONTAINER / naturalSize.w, CONTAINER / naturalSize.h) : 1;
+  const totalScale = zoom * baseScale;
+
+  async function handleSave() {
+    if (!naturalSize) return;
+    setSaving(true);
+    const blob = await getCroppedBlob(imageSrc, pan, totalScale, rotation, CONTAINER, OUTPUT);
+    onSave(blob);
+  }
+
+  return (
+    <div className="crop-modal">
+      <div className="crop-modal-inner">
+        <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--text)', textAlign: 'center', marginBottom: 20 }}>Adjust Photo</div>
+        <div
+          ref={containerRef}
+          className="crop-container"
+          style={{ width: CONTAINER, height: CONTAINER }}
+        >
+          {naturalSize && (
+            <img src={imageSrc} alt="" style={{
+              position: 'absolute', left: '50%', top: '50%',
+              width: naturalSize.w, height: naturalSize.h, maxWidth: 'none',
+              transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) rotate(${rotation}deg) scale(${totalScale})`,
+              transformOrigin: 'center', userSelect: 'none', pointerEvents: 'none',
+            }} />
+          )}
+        </div>
+        <div className="crop-controls">
+          <div className="crop-slider-row">
+            <span className="crop-slider-label">Zoom</span>
+            <input type="range" min="1" max="3" step="0.01" value={zoom} onChange={e => setZoom(parseFloat(e.target.value))} />
+          </div>
+          <div className="crop-slider-row">
+            <span className="crop-slider-label">Rotate</span>
+            <input type="range" min="-180" max="180" step="1" value={rotation} onChange={e => setRotation(parseInt(e.target.value))} />
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 20, width: '100%' }}>
+          <button className="crop-cancel-btn" onClick={onClose}>Cancel</button>
+          <button className="crop-save-btn" onClick={handleSave} disabled={saving || !naturalSize}>
+            {saving ? <span className="auth-spin" style={{ width: 14, height: 14, borderColor: '#000', borderTopColor: 'transparent' }} /> : 'Save Photo'}
+          </button>
+        </div>
+      </div>
+      {/* Hidden img used only to read natural dimensions */}
+      <img src={imageSrc} style={{ display: 'none' }} onLoad={e => setNaturalSize({ w: e.target.naturalWidth, h: e.target.naturalHeight })} alt="" />
+    </div>
+  );
+}
+
 /* ── My Profile Tab ── */
-function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, myFollowing, follows, favoriteArtists, toggleFavoriteArtist, onUpdateProfile }) {
+function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, myFollowing, follows, favoriteArtists, toggleFavoriteArtist, toggleFollow, onUpdateProfile, setArtistPage }) {
   const [tab, setTab] = useState("reviews");
   const [editingName, setEditingName] = useState(false);
   const [nameVal, setNameVal] = useState("");
   const [savingName, setSavingName] = useState(false);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [cropFile, setCropFile] = useState(null);
+  const [followModal, setFollowModal] = useState(null); // null | { title, fetchIds }
+  const [lightbox, setLightbox] = useState(null);
+  const avatarInputRef = useRef(null);
+
+  function handleAvatarChange(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"].includes(file.type)) {
+      setAlert({ title: "Invalid file", message: "Please choose a JPEG, PNG, WebP, or GIF image.", actions: [{ label: "OK", action: () => setAlert(null) }] });
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setAlert({ title: "File too large", message: "Please choose an image under 20MB.", actions: [{ label: "OK", action: () => setAlert(null) }] });
+      return;
+    }
+    setCropFile(file);
+  }
+
+  async function handleCropSave(blob) {
+    setCropFile(null);
+    setUploadingAvatar(true);
+    const file = new File([blob], 'avatar.jpg', { type: 'image/jpeg' });
+    const url = await uploadAvatar(myId, file);
+    if (url) onUpdateProfile?.({ avatar_url: url });
+    setUploadingAvatar(false);
+  }
+
+  async function handleEditAvatar() {
+    const url = currentUser?.avatar_url || currentUser?.images?.[0]?.url;
+    if (!url) { avatarInputRef.current?.click(); return; }
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      setCropFile(new File([blob], 'avatar.jpg', { type: blob.type || 'image/jpeg' }));
+    } catch {
+      avatarInputRef.current?.click();
+    }
+  }
+
+  const avatarUrl = currentUser?.avatar_url || currentUser?.images?.[0]?.url;
 
   const myReviews = reviews.filter(r => r.userId === myId).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const myLists = lists.filter(l => l.userId === myId);
@@ -1772,14 +2043,46 @@ function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike,
   }
 
   return (
+    <>
+    {cropFile && <AvatarCropModal imageFile={cropFile} onSave={handleCropSave} onClose={() => setCropFile(null)} />}
+    {lightbox && <PhotoLightbox src={lightbox} name={currentUser?.display_name} onClose={() => setLightbox(null)} />}
+    {followModal && (
+      <FollowListModal
+        title={followModal.title}
+        fetchIds={followModal.fetchIds}
+        allUsers={allUsers}
+        myId={myId}
+        myFollowing={myFollowing}
+        toggleFollow={toggleFollow}
+        navigate={navigate}
+        onClose={() => setFollowModal(null)}
+      />
+    )}
     <div className="screen">
-      <header className="nw-header" style={{ borderBottom: "none" }}><span className="nw-logo" style={{ fontSize: 18 }}>{currentUser?.display_name}</span></header>
       <div className="scroll-area">
         <div className="profile-hero">
-          <Avatar user={currentUser} size={70} />
+          <div className="avatar-upload-wrap" onClick={() => !uploadingAvatar && avatarUrl && setLightbox(avatarUrl)}>
+            <Avatar user={currentUser} size={70} />
+            <div className="avatar-upload-overlay">
+              {uploadingAvatar
+                ? <span className="auth-spin" style={{ width: 18, height: 18, borderColor: "#fff", borderTopColor: "transparent" }} />
+                : <div className="auo-actions">
+                    <button className="auo-btn" onClick={e => { e.stopPropagation(); handleEditAvatar(); }}>Edit</button>
+                    <button className="auo-btn" onClick={e => { e.stopPropagation(); avatarInputRef.current?.click(); }}>Upload</button>
+                  </div>
+              }
+            </div>
+            <input ref={avatarInputRef} type="file" accept="image/*,.heic,.heif" style={{ display: "none" }} onChange={handleAvatarChange} />
+          </div>
           <div className="profile-stats">
-            {[["Reviews", myReviews.length], ["Following", myFollowingCount], ["Followers", myFollowers]].map(([l, n]) => (
-              <div key={l} className="ps"><div className="ps-n">{n}</div><div className="ps-l">{l}</div></div>
+            {[
+              { label: "Reviews",   count: myReviews.length,    onClick: myReviews.length > 0     ? () => setTab("reviews")  : null },
+              { label: "Following", count: myFollowingCount,    onClick: myFollowingCount > 0 ? () => setFollowModal({ title: "Following", fetchIds: () => getFollowing(myId) }) : null },
+              { label: "Followers", count: myFollowers,         onClick: myFollowers > 0     ? () => setFollowModal({ title: "Followers", fetchIds: () => getFollowers(myId) }) : null },
+            ].map(({ label, count, onClick }) => (
+              <div key={label} className={`ps${onClick ? " ps-link" : ""}`} onClick={onClick ?? undefined}>
+                <div className="ps-n">{count}</div><div className="ps-l">{label}</div>
+              </div>
             ))}
           </div>
         </div>
@@ -1816,19 +2119,69 @@ function MyProfileTab({ currentUser, myId, reviews, lists, allUsers, toggleLike,
             <button key={k} className={`seg-btn ${tab === k ? "active" : ""}`} style={{ whiteSpace: "nowrap", flex: "0 0 auto", padding: "7px 12px" }} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
-        {tab === "favorites" && <FavoriteArtistsGrid artists={favoriteArtists} onArtist={artist => setModal({ type: "artistPage", artist })} onRemove={toggleFavoriteArtist} />}
-        {tab === "reviews" && (myReviews.length === 0 ? <div className="empty-feed"><div className="empty-art">⭐</div><h2 className="empty-h">No reviews yet</h2><button className="empty-cta" onClick={() => setModal({ type: "newReview" })}>Write your first review</button></div> : myReviews.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />))}
+        {tab === "favorites" && <FavoriteArtistsGrid artists={favoriteArtists} onArtist={artist => setArtistPage(artist)} onRemove={toggleFavoriteArtist} />}
+        {tab === "reviews" && (myReviews.length === 0 ? <div className="empty-feed"><div className="empty-art">⭐</div><h2 className="empty-h">No reviews yet</h2><button className="empty-cta" onClick={() => setModal({ type: "newReview" })}>Write your first review</button></div> : myReviews.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} setArtistPage={setArtistPage} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />))}
         {tab === "lists" && (myLists.length === 0 ? <div className="empty-feed"><div className="empty-art">📋</div><h2 className="empty-h">No lists yet</h2></div> : myLists.map(l => <ListCard key={l.id} list={l} allUsers={allUsers} currentUser={currentUser} myId={myId} navigate={navigate} setModal={setModal} setAlert={setAlert} deleteList={deleteList} />))}
+      </div>
+    </div>
+    </>
+  );
+}
+
+/* ── Follow List Modal ── */
+function FollowListModal({ title, fetchIds, allUsers, myId, myFollowing, toggleFollow, navigate, onClose }) {
+  const [ids, setIds] = useState(null);
+  useEffect(() => {
+    fetchIds().then(setIds).catch(() => setIds([]));
+  }, []);
+  return (
+    <div className="follow-modal-bg" onClick={onClose}>
+      <div className="follow-modal" onClick={e => e.stopPropagation()}>
+        <div className="follow-modal-hdr">
+          <span className="nw-logo" style={{ fontSize: 17 }}>{title}</span>
+          <button className="back-btn" onClick={onClose}>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#666" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+          </button>
+        </div>
+        <div className="follow-modal-list">
+          {ids === null ? (
+            <div style={{ display: "flex", justifyContent: "center", padding: 28 }}><div className="auth-spin" /></div>
+          ) : ids.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 28, color: "var(--text4)", fontSize: 14 }}>Nobody here yet.</div>
+          ) : ids.map(uid => {
+            const user = allUsers[uid];
+            const isMe = uid === myId;
+            const isFollowing = myFollowing.includes(uid);
+            return (
+              <div key={uid} className="follow-modal-row">
+                <button className="follow-modal-user" onClick={() => { onClose(); navigate("profile", { userId: uid }); }}>
+                  <Avatar user={user || { id: uid }} size={36} />
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{user?.display_name || uid?.slice(0, 10)}</div>
+                    {user?.username && <div style={{ fontSize: 12, color: "var(--text3)" }}>@{user.username}</div>}
+                  </div>
+                </button>
+                {!isMe && (
+                  <button className={`btn-follow ${isFollowing ? "following" : ""}`} onClick={() => toggleFollow(uid, user)}>
+                    {isFollowing ? "Following" : "Follow"}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
 }
 
 /* ── Profile Page (other users) ── */
-function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFollowing, follows, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, toggleFollow, goBack, loadUserData }) {
+function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFollowing, follows, toggleLike, navigate, setModal, setAlert, deleteReview, deleteList, toggleFollow, goBack, loadUserData, setArtistPage }) {
   const [tab, setTab] = useState("reviews");
   const [userData, setUserData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [followModal, setFollowModal] = useState(null);
+  const [lightbox, setLightbox] = useState(null);
   const user = allUsers[userId];
 
   useEffect(() => {
@@ -1849,6 +2202,20 @@ function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFo
   );
 
   return (
+    <>
+    {followModal && (
+      <FollowListModal
+        title={followModal.title}
+        fetchIds={followModal.fetchIds}
+        allUsers={allUsers}
+        myId={myId}
+        myFollowing={myFollowing}
+        toggleFollow={toggleFollow}
+        navigate={navigate}
+        onClose={() => setFollowModal(null)}
+      />
+    )}
+    {lightbox && <PhotoLightbox src={lightbox} name={user?.display_name} onClose={() => setLightbox(null)} />}
     <div className="screen">
       <header className="nw-header" style={{ borderBottom: "none" }}>
         <button className="back-btn" onClick={goBack}><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#007AFF" strokeWidth="2" strokeLinecap="round"><path d="M15 18l-6-6 6-6" /></svg></button>
@@ -1861,10 +2228,18 @@ function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFo
         ) : (
           <>
             <div className="profile-hero">
-              <Avatar user={user} size={70} />
+              {(() => { const u = user?.avatar_url || user?.images?.[0]?.url; return u
+                ? <div className="avatar-view-wrap" onClick={() => setLightbox(u)}><Avatar user={user} size={70} /></div>
+                : <Avatar user={user} size={70} />; })()}
               <div className="profile-stats">
-                {[["Reviews", userReviews.length], ["Following", userFollowing], ["Followers", userFollowers]].map(([l, n]) => (
-                  <div key={l} className="ps"><div className="ps-n">{n}</div><div className="ps-l">{l}</div></div>
+                {[
+                  { label: "Reviews",   count: userReviews.length, onClick: userReviews.length > 0 ? () => setTab("reviews") : null },
+                  { label: "Following", count: userFollowing,       onClick: userFollowing > 0  ? () => setFollowModal({ title: "Following", fetchIds: () => getFollowing(userId) }) : null },
+                  { label: "Followers", count: userFollowers,       onClick: userFollowers > 0  ? () => setFollowModal({ title: "Followers", fetchIds: () => getFollowers(userId) }) : null },
+                ].map(({ label, count, onClick }) => (
+                  <div key={label} className={`ps${onClick ? " ps-link" : ""}`} onClick={onClick ?? undefined}>
+                    <div className="ps-n">{count}</div><div className="ps-l">{label}</div>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1875,12 +2250,13 @@ function ProfilePage({ userId, reviews, lists, allUsers, currentUser, myId, myFo
                 <button key={k} className={`seg-btn ${tab === k ? "active" : ""}`} onClick={() => setTab(k)}>{l}</button>
               ))}
             </div>
-            {tab === "reviews" && (userReviews.length === 0 ? <div className="empty-inline">No reviews yet.</div> : userReviews.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />))}
+            {tab === "reviews" && (userReviews.length === 0 ? <div className="empty-inline">No reviews yet.</div> : userReviews.map(r => <ReviewCard key={r.id} review={r} currentUser={currentUser} allUsers={allUsers} toggleLike={toggleLike} navigate={navigate} setArtistPage={setArtistPage} onEdit={rev => setModal({ type: "editReview", review: rev })} onDelete={id => deleteReview(id)} />))}
             {tab === "lists" && (userLists.length === 0 ? <div className="empty-inline">No lists yet.</div> : userLists.map(l => <ListCard key={l.id} list={l} allUsers={allUsers} currentUser={currentUser} myId={myId} navigate={navigate} setModal={setModal} setAlert={setAlert} deleteList={deleteList} />))}
           </>
         )}
       </div>
     </div>
+    </>
   );
 }
 
@@ -1919,12 +2295,35 @@ function ReviewDetailPage({ review, reviews, allUsers, currentUser, myId, toggle
             <svg viewBox="0 0 24 24" width="16" height="16" fill={liked ? "#E9463F" : "none"} stroke={liked ? "#E9463F" : "#555"} strokeWidth="2" strokeLinecap="round"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z" /></svg>
             {live.likes?.length || 0} {live.likes?.length === 1 ? "like" : "likes"}
           </button>
-          {live.item.appleUrl && (
-            <a className="apple-music-link" href={live.item.appleUrl} target="_blank" rel="noopener noreferrer">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M23.994 6.124a9.23 9.23 0 00-.24-2.19c-.317-1.31-1.062-2.31-2.18-3.043a5.022 5.022 0 00-1.877-.726 10.496 10.496 0 00-1.564-.15c-.04-.003-.083-.01-.124-.013H5.986c-.152.01-.303.017-.455.026C4.786.07 4.043.15 3.34.428 2.004.958 1.04 1.88.475 3.208c-.192.448-.292.925-.363 1.408-.056.392-.088.785-.1 1.18 0 .032-.007.062-.01.093v12.223c.01.14.017.283.027.424.05.815.154 1.624.497 2.373.65 1.42 1.738 2.353 3.234 2.802.42.127.856.187 1.293.228.555.053 1.11.06 1.667.06h11.03c.525 0 1.048-.034 1.57-.1.823-.106 1.597-.35 2.296-.81a5.046 5.046 0 001.88-2.207c.186-.42.293-.87.37-1.324.113-.675.14-1.358.138-2.04-.003-3.8 0-7.595-.003-11.393zm-6.423 3.99v5.712c0 .417-.058.827-.244 1.206-.29.59-.76.962-1.388 1.14-.35.1-.706.157-1.07.173-.95.045-1.773-.6-1.943-1.536a1.88 1.88 0 011.038-2.022c.323-.16.67-.25 1.018-.324.378-.082.758-.153 1.134-.24.274-.063.457-.23.51-.516a.904.904 0 00.02-.183c0-1.956 0-3.912.003-5.868 0-.122-.034-.16-.156-.138-.795.154-1.59.3-2.387.45l-3.235.616c-.1.02-.161.055-.161.18.004 2.8.003 5.6.003 8.4v.188c0 .002-.004.006-.01.016-.12-.048-.232-.09-.34-.142a1.869 1.869 0 01-1.08-1.726c.015-.9.584-1.67 1.44-1.938.318-.1.65-.157.974-.228.356-.076.713-.15 1.07-.225.25-.053.45-.2.51-.47a.921.921 0 00.022-.21c.001-1.994 0-3.988.003-5.982 0-.135.033-.167.166-.19l5.822-1.1c.151-.026.22.004.22.188-.006 1.093-.003 2.185-.003 3.278z"/></svg>
-              Open in Apple Music
+        </div>
+        <div className="rd-stream">
+          <div className="rd-stream-label">Listen on</div>
+          <div className="rd-stream-links">
+            {live.item.previewUrl && (
+              <a className="rd-sl rd-sl-preview" href={live.item.previewUrl} target="_blank" rel="noopener noreferrer">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                Preview
+              </a>
+            )}
+            {live.item.appleUrl && (
+              <a className="rd-sl rd-sl-apple" href={live.item.appleUrl} target="_blank" rel="noopener noreferrer">
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M23.994 6.124a9.23 9.23 0 00-.24-2.19c-.317-1.31-1.062-2.31-2.18-3.043a5.022 5.022 0 00-1.877-.726 10.496 10.496 0 00-1.564-.15c-.04-.003-.083-.01-.124-.013H5.986c-.152.01-.303.017-.455.026C4.786.07 4.043.15 3.34.428 2.004.958 1.04 1.88.475 3.208c-.192.448-.292.925-.363 1.408-.056.392-.088.785-.1 1.18 0 .032-.007.062-.01.093v12.223c.01.14.017.283.027.424.05.815.154 1.624.497 2.373.65 1.42 1.738 2.353 3.234 2.802.42.127.856.187 1.293.228.555.053 1.11.06 1.667.06h11.03c.525 0 1.048-.034 1.57-.1.823-.106 1.597-.35 2.296-.81a5.046 5.046 0 001.88-2.207c.186-.42.293-.87.37-1.324.113-.675.14-1.358.138-2.04-.003-3.8 0-7.595-.003-11.393zm-6.423 3.99v5.712c0 .417-.058.827-.244 1.206-.29.59-.76.962-1.388 1.14-.35.1-.706.157-1.07.173-.95.045-1.773-.6-1.943-1.536a1.88 1.88 0 011.038-2.022c.323-.16.67-.25 1.018-.324.378-.082.758-.153 1.134-.24.274-.063.457-.23.51-.516a.904.904 0 00.02-.183c0-1.956 0-3.912.003-5.868 0-.122-.034-.16-.156-.138-.795.154-1.59.3-2.387.45l-3.235.616c-.1.02-.161.055-.161.18.004 2.8.003 5.6.003 8.4v.188c0 .002-.004.006-.01.016-.12-.048-.232-.09-.34-.142a1.869 1.869 0 01-1.08-1.726c.015-.9.584-1.67 1.44-1.938.318-.1.65-.157.974-.228.356-.076.713-.15 1.07-.225.25-.053.45-.2.51-.47a.921.921 0 00.022-.21c.001-1.994 0-3.988.003-5.982 0-.135.033-.167.166-.19l5.822-1.1c.151-.026.22.004.22.188-.006 1.093-.003 2.185-.003 3.278z"/></svg>
+                Apple Music
+              </a>
+            )}
+            <a className="rd-sl rd-sl-spotify" href={`https://open.spotify.com/search/${encodeURIComponent(live.item.artist + ' ' + live.item.title)}`} target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+              Spotify
             </a>
-          )}
+            <a className="rd-sl rd-sl-tidal" href={`https://tidal.com/search?q=${encodeURIComponent(live.item.artist + ' ' + live.item.title)}`} target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12.012 3.992L8.008 7.996 4.004 3.992 0 7.996l4.004 4.004 4.004-4.004 4.004 4.004 4.004-4.004L20.02 12l4.004-4.004-4.004-4.004-4.004 4.004-4.004-4.004zM8.008 16.008l4.004-4.004 4.004 4.004-4.004 4.004z"/></svg>
+              Tidal
+            </a>
+            <a className="rd-sl rd-sl-ytmusic" href={`https://music.youtube.com/search?q=${encodeURIComponent(live.item.artist + ' ' + live.item.title)}`} target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M12 0C5.376 0 0 5.376 0 12s5.376 12 12 12 12-5.376 12-12S18.624 0 12 0zm0 19.104c-3.924 0-7.104-3.18-7.104-7.104S8.076 4.896 12 4.896s7.104 3.18 7.104 7.104-3.18 7.104-7.104 7.104zm0-13.332c-3.432 0-6.228 2.796-6.228 6.228S8.568 18.228 12 18.228s6.228-2.796 6.228-6.228S15.432 5.772 12 5.772zM9.684 15.54V8.46L16.2 12l-6.516 3.54z"/></svg>
+              YT Music
+            </a>
+          </div>
         </div>
         <div className="comments">
           <div className="sect-label" style={{ marginBottom: 12 }}>Comments · {live.comments?.length || 0}</div>
@@ -2009,17 +2408,21 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .nw-main{padding-bottom:var(--tab-h)}
 .screen{display:flex;flex-direction:column;min-height:100vh}
 .subpage-ov{position:fixed;inset:0;z-index:100;background:var(--bg);overflow-y:auto;max-width:430px;margin:0 auto;animation:slideUp .2s ease}
+.nw-topbar{display:flex;align-items:center;justify-content:space-between;padding:48px 16px 12px;position:sticky;top:0;z-index:25;background:rgba(20,24,28,.93);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
 .nw-header{display:flex;align-items:center;justify-content:space-between;padding:48px 16px 12px;position:sticky;top:0;z-index:20;background:rgba(20,24,28,.93);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
 .nw-logo{font-family:var(--serif);font-size:22px;color:var(--text);font-style:italic;letter-spacing:-.3px}
+.nw-logo-btn{font-family:var(--serif);font-size:22px;color:var(--text);font-style:italic;letter-spacing:-.3px;background:none;border:none;cursor:pointer;padding:0;transition:opacity .15s}
+.nw-logo-btn:hover{opacity:.7}
 .back-btn{background:none;border:none;cursor:pointer;padding:4px;display:flex;align-items:center;width:32px}
 .header-btn{display:flex;align-items:center;gap:5px;background:var(--green);color:#000;border:none;font-family:var(--font);font-size:13px;font-weight:700;padding:7px 14px;border-radius:4px;cursor:pointer;transition:opacity .15s}
 .header-btn:hover{opacity:.88}
 .avatar-btn{display:flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;padding:3px;border-radius:20px}
 .user-menu{position:absolute;top:calc(100% + 8px);right:0;background:var(--s2);border:1px solid var(--border2);border-radius:10px;min-width:200px;overflow:hidden;z-index:300;box-shadow:0 8px 32px rgba(0,0,0,.7);animation:slideUp .15s ease}
-.user-menu-info{display:flex;align-items:center;gap:10px;padding:14px 14px 12px;border-bottom:1px solid var(--border)}
+.user-menu-info{display:flex;align-items:center;gap:10px;padding:14px 14px 12px;border-bottom:1px solid var(--border);width:100%;background:none;border-left:none;border-right:none;border-top:none;font-family:var(--font);cursor:pointer;text-align:left;transition:background .1s}
+.user-menu-info:hover{background:var(--s3)}
 .user-menu-item{display:flex;align-items:center;gap:8px;width:100%;padding:11px 14px;background:none;border:none;color:var(--text2);font-family:var(--font);font-size:14px;cursor:pointer;transition:background .1s}
 .user-menu-item:hover{background:var(--s3);color:var(--text)}
-.sticky-search{padding:8px 14px;background:rgba(20,24,28,.93);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);position:sticky;top:85px;z-index:19;border-bottom:1px solid var(--border)}
+.sticky-search{padding:8px 14px;background:rgba(20,24,28,.93);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);position:sticky;top:89px;z-index:19;border-bottom:1px solid var(--border)}
 .scroll-area{flex:1;padding:14px 14px 28px}
 .sect-label{font-size:11px;font-weight:700;color:var(--text3);letter-spacing:1px;text-transform:uppercase;margin-bottom:12px}
 .isb-wrap{position:relative;width:100%}
@@ -2058,6 +2461,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .rc-track-row{cursor:pointer;margin-bottom:8px}
 .rc-track-name{font-family:var(--serif);font-size:17px;font-style:italic;color:var(--text);line-height:1.2}
 .rc-track-sub{font-size:12px;color:var(--text3);margin-top:2px}
+.rc-artist-link{background:none;border:none;padding:0;font-size:12px;color:var(--text3);cursor:pointer;font-family:var(--font);transition:color .1s}
+.rc-artist-link:hover{color:var(--green)}
 .rc-meta-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 .rc-author{display:flex;align-items:center;gap:6px;background:none;border:none;cursor:pointer;padding:0}
 .rc-author-name{font-size:12px;font-weight:600;color:var(--text2);transition:color .1s}
@@ -2098,9 +2503,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .pill.active{background:var(--green);border-color:var(--green);color:#000}
 .profile-hero{display:flex;align-items:center;gap:18px;padding:6px 0 18px}
 .profile-stats{display:flex;flex:1}
-.ps{flex:1;text-align:center}
+.ps{flex:1;text-align:center;padding:4px 0;border-radius:8px;transition:background .1s}
+.ps-link{cursor:pointer}
+.ps-link:hover{background:var(--s2)}
 .ps-n{font-size:20px;font-weight:700;color:var(--text);font-family:var(--serif)}
 .ps-l{font-size:11px;color:var(--text3);margin-top:1px;letter-spacing:.3px;text-transform:uppercase}
+.follow-modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:400;display:flex;align-items:flex-end;justify-content:center;animation:fadeIn .15s ease}
+.follow-modal{background:var(--s1);border-radius:16px 16px 0 0;width:100%;max-width:430px;max-height:72vh;display:flex;flex-direction:column;animation:slideUp .2s ease}
+.follow-modal-hdr{display:flex;align-items:center;justify-content:space-between;padding:16px 16px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
+.follow-modal-list{overflow-y:auto;flex:1;padding:6px 0 24px}
+.follow-modal-row{display:flex;align-items:center;gap:12px;padding:10px 16px}
+.follow-modal-user{display:flex;align-items:center;gap:10px;flex:1;background:none;border:none;cursor:pointer;padding:0;text-align:left;min-width:0}
 .profile-name{font-size:20px;font-weight:700;font-family:var(--serif);font-style:italic;color:var(--text);margin-bottom:3px}
 .profile-handle{font-size:12px;color:var(--text4);margin-bottom:18px}
 .profile-follow-btn{width:100%;background:none;border:1px solid var(--green);color:var(--green);font-family:var(--font);font-size:15px;font-weight:700;padding:12px;border-radius:5px;cursor:pointer;margin-bottom:18px;transition:all .15s}
@@ -2134,6 +2547,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .rd-body h3{font-size:15px;font-weight:700;color:var(--text);margin-bottom:5px;font-family:var(--serif)}
 .rd-body ul{padding-left:18px}.rd-body li{margin-bottom:3px}
 .rd-acts{display:flex;gap:14px;padding:8px 0}
+.rd-stream{padding:12px 0 4px}
+.rd-stream-label{font-size:11px;font-weight:700;color:var(--text3);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px}
+.rd-stream-links{display:flex;gap:8px;flex-wrap:wrap}
+.rd-sl{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;font-family:var(--font);text-decoration:none;padding:6px 11px;border-radius:20px;border:1px solid var(--border2);color:var(--text2);transition:all .15s;white-space:nowrap}
+.rd-sl:hover{border-color:var(--text2);color:var(--text)}
+.rd-sl-preview{border-color:var(--green);color:var(--green)}
+.rd-sl-preview:hover{background:var(--green);color:#000}
+.rd-sl-apple:hover{border-color:#fc3c44;color:#fc3c44}
+.rd-sl-spotify:hover{border-color:#1DB954;color:#1DB954}
+.rd-sl-tidal:hover{border-color:#00FFFF;color:#00FFFF}
+.rd-sl-ytmusic:hover{border-color:#FF0000;color:#FF0000}
 .comments{padding-top:4px}
 .comment-row{display:flex;align-items:flex-start;gap:9px;padding:9px 0;border-bottom:1px solid var(--border)}
 .comment-author{font-size:13px;font-weight:600;color:var(--text)}
@@ -2245,9 +2669,32 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
 .name-edit-cancel:hover{color:var(--text2)}
 .name-pencil-btn{background:none;border:none;color:var(--text4);cursor:pointer;padding:4px;display:flex;align-items:center;transition:color .12s;flex-shrink:0}
 .name-pencil-btn:hover{color:var(--green)}
+.avatar-upload-wrap{position:relative;cursor:pointer;display:inline-flex;flex-shrink:0}
+.avatar-upload-overlay{position:absolute;inset:0;border-radius:50%;background:rgba(0,0,0,0);display:flex;align-items:center;justify-content:center;transition:background .15s;opacity:0}
+.avatar-upload-wrap:hover .avatar-upload-overlay{background:rgba(0,0,0,.6);opacity:1}
+.auo-actions{display:flex;flex-direction:column;align-items:center;gap:5px}
+.auo-btn{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.35);color:#fff;font-family:var(--font);font-size:10px;font-weight:700;padding:4px 10px;border-radius:4px;cursor:pointer;letter-spacing:.4px;text-transform:uppercase;transition:background .1s;white-space:nowrap}
+.auo-btn:hover{background:rgba(255,255,255,.2)}
+.avatar-view-wrap{display:inline-flex;flex-shrink:0;cursor:pointer;border-radius:50%;transition:opacity .15s}
+.avatar-view-wrap:hover{opacity:.85}
+.lightbox-bg{position:fixed;inset:0;background:rgba(0,0,0,.82);backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);z-index:600;display:flex;align-items:center;justify-content:center;animation:fadeIn .15s ease;cursor:pointer}
+.lightbox-img{width:min(300px,80vw);height:min(300px,80vw);border-radius:50%;object-fit:cover;box-shadow:0 24px 64px rgba(0,0,0,.9);cursor:default;animation:popIn .2s cubic-bezier(.34,1.56,.64,1)}
+.lightbox-close{position:fixed;top:18px;right:18px;background:rgba(255,255,255,.12);border:none;color:#fff;width:36px;height:36px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s;z-index:601}
+.lightbox-close:hover{background:rgba(255,255,255,.22)}
 .preview-btn{position:absolute;bottom:4px;right:4px;width:22px;height:22px;border-radius:50%;background:rgba(0,0,0,.7);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;backdrop-filter:blur(4px);transition:background .15s;z-index:2}
 .preview-btn:hover{background:rgba(0,0,0,.9)}
 .preview-btn-lg{width:34px;height:34px;bottom:7px;right:7px}
 .apple-music-link{display:inline-flex;align-items:center;gap:6px;color:var(--text3);font-size:13px;font-family:var(--font);text-decoration:none;padding:6px 10px;border:1px solid var(--border);border-radius:6px;transition:color .15s,border-color .15s}
 .apple-music-link:hover{color:#fc3c44;border-color:#fc3c44}
+.crop-modal{position:fixed;inset:0;background:rgba(0,0,0,.88);display:flex;align-items:center;justify-content:center;z-index:1000;padding:16px}
+.crop-modal-inner{background:var(--s1);border-radius:16px;padding:24px;display:flex;flex-direction:column;align-items:center;width:100%;max-width:340px;border:1px solid var(--border)}
+.crop-container{border-radius:50%;overflow:hidden;background:#000;position:relative;flex-shrink:0;touch-action:none;cursor:grab;user-select:none}
+.crop-container:active{cursor:grabbing}
+.crop-controls{width:100%;margin-top:20px;display:flex;flex-direction:column;gap:12px}
+.crop-slider-row{display:flex;align-items:center;gap:12px}
+.crop-slider-label{font-size:12px;color:var(--text3);width:44px;flex-shrink:0;text-align:right}
+.crop-slider-row input[type=range]{flex:1;accent-color:var(--green);height:4px}
+.crop-cancel-btn{flex:1;background:var(--s2);border:1px solid var(--border);color:var(--text);font-family:var(--font);font-size:14px;font-weight:600;padding:12px;border-radius:8px;cursor:pointer}
+.crop-save-btn{flex:1;background:var(--green);border:none;color:#000;font-family:var(--font);font-size:14px;font-weight:700;padding:12px;border-radius:8px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}
+.crop-save-btn:disabled{opacity:.5;cursor:not-allowed}
 `;

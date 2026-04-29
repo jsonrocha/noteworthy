@@ -3,16 +3,11 @@ import { createClient } from '@supabase/supabase-js';
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-// Every Supabase request — auth token refresh, DB queries, realtime auth —
-// goes through this fetch wrapper. If any individual request hangs for more
-// than 10 seconds it is aborted, so the app can never get stuck indefinitely.
-function fetchWithTimeout(url, options = {}) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    return fetch(url, { ...options, signal: controller.signal })
-        .finally(() => clearTimeout(timer));
+// Store the client on globalThis so Vite HMR re-executions of this module
+// reuse the same instance instead of creating a new one that fights for the
+// same Web Lock used by Supabase's auth token refresh.
+if (!globalThis.__nw_supabase) {
+    globalThis.__nw_supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 }
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    global: { fetch: fetchWithTimeout },
-});
+export const supabase = globalThis.__nw_supabase;

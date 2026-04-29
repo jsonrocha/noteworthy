@@ -286,3 +286,16 @@ export async function updateDisplayName(userId, displayName) {
     const { error } = await supabase.from('users').update({ display_name: displayName }).eq('id', userId);
     if (error) console.error('updateDisplayName', error);
 }
+
+export async function uploadAvatar(userId, file) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    const path = `${userId}/avatar.${ext}`;
+    const { error } = await supabase.storage
+        .from('avatars')
+        .upload(path, file, { upsert: true, contentType: file.type });
+    if (error) { console.error('uploadAvatar', error); return null; }
+    const { data } = supabase.storage.from('avatars').getPublicUrl(path);
+    const avatarUrl = data.publicUrl + '?t=' + Date.now(); // cache-bust on re-upload
+    await supabase.from('users').update({ avatar_url: avatarUrl }).eq('id', userId);
+    return avatarUrl;
+}
